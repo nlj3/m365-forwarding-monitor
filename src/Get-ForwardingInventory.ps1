@@ -14,7 +14,11 @@ function Get-M365ForwardingInventory {
         [object[]]$ApprovedExceptions = @(),
 
         [Parameter()]
-        [string]$OutputPath = "./output"
+        [string]$OutputPath = "./output",
+
+        # Receives the user principal name of every user whose mailbox could not be read.
+        [Parameter()]
+        [System.Collections.Generic.List[string]]$FailedUsers = [System.Collections.Generic.List[string]]::new()
     )
 
     $detectedAt = (Get-Date).ToString("o")
@@ -26,12 +30,20 @@ function Get-M365ForwardingInventory {
             continue
         }
 
-        $mailbox = Invoke-M365CallWithRetry -OperationName "Get-Mailbox $upn" -OutputPath $OutputPath -ScriptBlock {
-            Get-Mailbox -Identity $upn -ErrorAction Stop |
-                Select-Object DisplayName, UserPrincipalName, PrimarySmtpAddress, ForwardingAddress, ForwardingSmtpAddress, DeliverToMailboxAndForward
+        # A mailbox that cannot be read is counted, never skipped silently: a scan that cannot see must not look clean.
+        try {
+            $mailbox = Invoke-M365CallWithRetry -OperationName "Get-Mailbox $upn" -OutputPath $OutputPath -ThrowOnFailure -ScriptBlock {
+                Get-Mailbox -Identity $upn -ErrorAction Stop |
+                    Select-Object DisplayName, UserPrincipalName, PrimarySmtpAddress, ForwardingAddress, ForwardingSmtpAddress, DeliverToMailboxAndForward
+            }
+        }
+        catch {
+            $FailedUsers.Add($upn)
+            continue
         }
 
         if ($null -eq $mailbox) {
+            $FailedUsers.Add($upn)
             continue
         }
 

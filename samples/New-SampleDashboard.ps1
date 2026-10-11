@@ -180,6 +180,11 @@ $summary = [pscustomobject]@{
     HighCriticalRiskCount         = @($allForwarding | Where-Object { $_.RiskLevel -in @('High', 'Critical') }).Count
     AbnormalOutboundCount         = @($outboundCounts | Where-Object { $_.RiskLevel -in @('Medium', 'Critical') }).Count
     AboveBaselineOutboundCount    = @($outboundCounts | Where-Object { $_.IsAboveBaseline }).Count
+    TraceTruncated                = $false
+    CollectionFailures            = [pscustomobject]@{
+        MailboxForwarding = [pscustomobject]@{ Count = 0; UserPrincipalNames = @() }
+        InboxRules        = [pscustomobject]@{ Count = 0; UserPrincipalNames = @() }
+    }
 }
 
 New-M365ForwardingDashboard -Summary $summary -ForwardingFindings $allForwarding -OutboundCounts $outboundCounts -OutputPath $OutputPath

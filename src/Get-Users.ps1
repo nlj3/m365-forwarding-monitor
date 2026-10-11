@@ -8,7 +8,8 @@ function Get-M365MonitorUsers {
         [string]$OutputPath = "./output"
     )
 
-    $users = Invoke-M365CallWithRetry -OperationName "Graph users list" -OutputPath $OutputPath -ScriptBlock {
+    # One call lists every user. If it fails, the scan has nothing to look at, so it throws and the run stops.
+    $users = Invoke-M365CallWithRetry -OperationName "Graph users list" -OutputPath $OutputPath -ThrowOnFailure -ScriptBlock {
         Write-Host "Listing users with Microsoft Graph metadata only..."
         $allUsers = [System.Collections.Generic.List[object]]::new()
         $uri = 'https://graph.microsoft.com/v1.0/users?$select=id,displayName,userPrincipalName,mail,accountEnabled,userType&$top=999'

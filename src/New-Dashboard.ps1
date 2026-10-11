@@ -6,6 +6,45 @@ function ConvertTo-M365Html {
     return [System.Net.WebUtility]::HtmlEncode([string]$Value)
 }
 
+function Get-M365DashboardWarningHtml {
+    param([Parameter(Mandatory)][object]$Summary)
+
+    # A scan that could not see everything must say so at the top of the page.
+    # Older summaries have no failure fields, so a missing field counts as nothing to report.
+    $maxNamesListed = 25
+    $lines = [System.Collections.Generic.List[string]]::new()
+
+    $failures = if ($Summary.PSObject.Properties.Name -contains "CollectionFailures") { $Summary.CollectionFailures } else { $null }
+    foreach ($item in @(
+            @{ Label = "Mailbox forwarding"; Failure = $(if ($failures) { $failures.MailboxForwarding }) },
+            @{ Label = "Inbox rules"; Failure = $(if ($failures) { $failures.InboxRules }) })) {
+        if ($null -eq $item.Failure -or [int]$item.Failure.Count -le 0) { continue }
+
+        $names = @($item.Failure.UserPrincipalNames)
+        $listed = @($names | Select-Object -First $maxNamesListed | ForEach-Object { ConvertTo-M365Html $_ }) -join ", "
+        if ($names.Count -gt $maxNamesListed) { $listed += " and $($names.Count - $maxNamesListed) more" }
+        $noun = if ([int]$item.Failure.Count -eq 1) { "user" } else { "users" }
+        $lines.Add("$($item.Label) could not be read for $([int]$item.Failure.Count) ${noun}: $listed")
+    }
+
+    if ($Summary.PSObject.Properties.Name -contains "TraceTruncated" -and $Summary.TraceTruncated -eq $true) {
+        $lines.Add("The message trace reached its row limit, so outbound counts can be too low.")
+    }
+
+    if ($lines.Count -eq 0) { return "" }
+
+    $items = ($lines | ForEach-Object { "<li>$_</li>" }) -join "`n        "
+    return @"
+<section class="warning" role="alert">
+      <strong>Incomplete scan.</strong> The results below leave out what could not be read.
+      <ul>
+        $items
+      </ul>
+      Check errors.log, fix the cause, and run the scan again.
+    </section>
+"@
+}
+
 function New-M365ForwardingDashboard {
     [CmdletBinding()]
     param(
@@ -21,14 +60,19 @@ function New-M365ForwardingDashboard {
         [object[]]$OutboundCounts,
 
         [Parameter(Mandatory)]
-        [string]$OutputPath
+        [string]$OutputPath,
+
+        # Where to write the page. Defaults to dashboard.html in OutputPath.
+        [Parameter()]
+        [string]$FilePath
     )
 
     if (-not (Test-Path -LiteralPath $OutputPath)) {
         New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null
     }
 
-    $dashboardPath = Join-Path $OutputPath "dashboard.html"
+    $dashboardPath = if ([string]::IsNullOrWhiteSpace($FilePath)) { Join-Path $OutputPath "dashboard.html" } else { $FilePath }
+    $warningHtml = Get-M365DashboardWarningHtml -Summary $Summary
     $generatedAt = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss zzz")
 
     $riskOrder = @{ Critical = 1; High = 2; Medium = 3; Low = 4; Exception = 5; Approved = 5 }
@@ -117,6 +161,8 @@ function New-M365ForwardingDashboard {
     tr:last-child td { border-bottom:none; }
     .badge { display:inline-block; min-width:68px; text-align:center; padding:4px 8px; border-radius:999px; color:#fff; font-size:12px; font-weight:650; }
     .Critical { background:var(--critical); } .High { background:var(--high); } .Medium { background:var(--medium); } .Low { background:var(--low); } .Exception, .Approved { background:var(--exception); }
+    .warning { background:#fff4e5; border:1px solid #f0b86e; color:#5b3a00; border-radius:8px; padding:14px 18px; margin-bottom:18px; line-height:1.45; }
+    .warning ul { margin:8px 0; padding-left:20px; }
     .empty { color:var(--muted); text-align:center; padding:22px; }
     footer { color:var(--muted); font-size:12px; padding:0 36px 26px; }
     @media (max-width: 720px) { header, main, footer { padding-left:18px; padding-right:18px; } table { display:block; overflow-x:auto; white-space:nowrap; } }
@@ -128,6 +174,7 @@ function New-M365ForwardingDashboard {
     <p>Generated $generatedAt. Metadata-only dashboard: no email bodies, subjects, message previews, attachment contents, or individual message content are collected or displayed.</p>
   </header>
   <main>
+    $warningHtml
     <div class="cards">
       $($cardHtml -join "`n      ")
     </div>
@@ -158,6 +205,6 @@ function New-M365ForwardingDashboard {
 </html>
 "@
 
-    Set-Content -Path $dashboardPath -Value $html -Encoding UTF8
+    Set-Content -LiteralPath $dashboardPath -Value $html -Encoding UTF8
     return $dashboardPath
 }

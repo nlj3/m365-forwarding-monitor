@@ -14,7 +14,11 @@ function Get-M365MessageRuleForwarding {
         [object[]]$ApprovedExceptions = @(),
 
         [Parameter()]
-        [string]$OutputPath = "./output"
+        [string]$OutputPath = "./output",
+
+        # Receives the user principal name of every user whose inbox rules could not be read.
+        [Parameter()]
+        [System.Collections.Generic.List[string]]$FailedUsers = [System.Collections.Generic.List[string]]::new()
     )
 
     $detectedAt = (Get-Date).ToString("o")
@@ -26,11 +30,23 @@ function Get-M365MessageRuleForwarding {
             continue
         }
 
-        $rules = Invoke-M365CallWithRetry -OperationName "Graph messageRules $upn" -OutputPath $OutputPath -ScriptBlock {
-            Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/users/$upn/mailFolders/inbox/messageRules" -ErrorAction Stop
+        # Rules that cannot be read are counted, never skipped silently: a scan that cannot see must not look clean.
+        try {
+            $rules = Invoke-M365CallWithRetry -OperationName "Graph messageRules $upn" -OutputPath $OutputPath -ThrowOnFailure -ScriptBlock {
+                Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/users/$upn/mailFolders/inbox/messageRules" -ErrorAction Stop
+            }
+        }
+        catch {
+            $FailedUsers.Add($upn)
+            continue
         }
 
-        if ($null -eq $rules -or $null -eq $rules.value) {
+        if ($null -eq $rules) {
+            $FailedUsers.Add($upn)
+            continue
+        }
+
+        if ($null -eq $rules.value) {
             continue
         }
 
