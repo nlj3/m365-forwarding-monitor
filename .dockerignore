@@ -8,6 +8,8 @@ output/*
 config/settings.json
 config/approved-exceptions.csv
 config/certs
+# Docker Compose reads .env from the host. It must not enter the image.
+.env
 *.pfx
 *.p12
 *.pem
