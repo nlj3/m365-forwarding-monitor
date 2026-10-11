@@ -1,0 +1,23 @@
+# M365 Forwarding Monitor is metadata-only. The container mounts local config and
+# output folders and does not read or store email bodies, subjects, previews, or attachments.
+
+services:
+  m365-forwarding-monitor:
+    build:
+      context: .
+    image: m365-forwarding-monitor:local
+    container_name: m365-forwarding-monitor
+    stdin_open: true
+    tty: true
+    environment:
+      M365_SETTINGS_PATH: /app/config/settings.json
+      M365_APPROVED_EXCEPTIONS_PATH: /app/config/approved-exceptions.csv
+      M365_USE_DEVICE_AUTH: "true"
+      M365_CERT_PASSWORD: ${M365_CERT_PASSWORD:-}
+    volumes:
+      - ./config:/app/config:ro
+      - ./output:/app/output
+      - m365-ps-auth:/root/.local/share/powershell
+
+volumes:
+  m365-ps-auth:

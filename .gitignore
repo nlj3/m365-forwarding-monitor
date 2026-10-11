@@ -1,0 +1,8 @@
+# Live configuration and anything a scan produces stay on the machine that runs it.
+config/settings.json
+config/approved-exceptions.csv
+config/certs/
+output/
+*.pfx
+.env
+.DS_Store

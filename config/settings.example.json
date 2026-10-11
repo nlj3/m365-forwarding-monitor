@@ -1,0 +1,43 @@
+{
+  "MetadataOnlyNotice": "M365 Forwarding Monitor stores forwarding/security metadata only. It does not read or store email bodies, subjects, message previews, attachment contents, or individual message content.",
+  "TenantId": "00000000-0000-0000-0000-000000000000",
+  "AuthMode": "DeviceCode",
+  "ApplicationClientId": "",
+  "OrganizationName": "Contoso",
+  "ExchangeOrganization": "contoso.onmicrosoft.com",
+  "CertificatePath": "/app/config/certs/m365-forwarding-monitor.pfx",
+  "CertificatePasswordEnvVar": "M365_CERT_PASSWORD",
+  "InternalDomains": [
+    "contoso.com",
+    "contoso.onmicrosoft.com"
+  ],
+  "PersonalDomains": [
+    "gmail.com",
+    "googlemail.com",
+    "yahoo.com",
+    "outlook.com",
+    "hotmail.com",
+    "live.com",
+    "msn.com",
+    "icloud.com",
+    "me.com",
+    "proton.me",
+    "protonmail.com",
+    "aol.com",
+    "gmx.com",
+    "mail.com",
+    "zoho.com"
+  ],
+  "LookbackHours": 24,
+  "OutboundWarningThreshold": 100,
+  "OutboundCriticalThreshold": 250,
+  "OutboundAttentionThreshold": 20,
+  "AfterHoursWarningThreshold": 25,
+  "BaselineMultiplier": 2.5,
+  "BaselineMinimumSamples": 3,
+  "BaselineRetentionDays": 90,
+  "BusinessHoursStart": 8,
+  "BusinessHoursEnd": 18,
+  "OutputPath": "./output",
+  "PrivacyMode": true
+}

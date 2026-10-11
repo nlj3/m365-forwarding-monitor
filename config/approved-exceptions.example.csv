@@ -1,0 +1,2 @@
+UserPrincipalName,ApprovedTarget,Reason,ApprovedBy,ExpirationDate
+alex.wilber@contoso.com,archive-vault@trusted-partner.example,Metadata-only approved forwarding exception for legal hold export routing,security.manager@contoso.com,2026-12-31

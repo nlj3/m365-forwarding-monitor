@@ -1,0 +1,16 @@
+# M365 Forwarding Monitor is metadata-only. Do not bake runtime output,
+# tenant config, tokens, logs, email bodies, subjects, previews, or attachments into images.
+
+.git
+.DS_Store
+output/*
+!output/.gitkeep
+config/settings.json
+config/approved-exceptions.csv
+config/certs
+*.pfx
+*.p12
+*.pem
+*.key
+*.log
+*.tmp
