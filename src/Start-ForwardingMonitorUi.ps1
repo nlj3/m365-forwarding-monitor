@@ -141,6 +141,37 @@ function Get-UiAuthChallenge {
     return $null
 }
 
+function Test-UiScanRequest {
+    param(
+        # The Origin header exactly as received, or $null when the request has none.
+        [Parameter()]
+        [AllowNull()]
+        [object]$Origin,
+
+        # The Content-Type header exactly as received, or $null when the request has none.
+        [Parameter()]
+        [AllowNull()]
+        [object]$ContentType,
+
+        [Parameter(Mandatory)]
+        [int]$Port
+    )
+
+    # A web page on another site can make the browser send a POST to this local server.
+    # So a request that names an origin must name this server's own, and the body must be declared as JSON,
+    # which a page on another site cannot send without a cross-origin check that this server does not answer.
+    if ($null -ne $Origin -and ([string]$Origin).Trim().ToLowerInvariant() -ne "http://localhost:$Port") {
+        return [pscustomobject]@{ Allowed = $false; Reason = "The request came from a different origin." }
+    }
+
+    $mediaType = ([string]$ContentType -split ";")[0].Trim().ToLowerInvariant()
+    if ($mediaType -ne "application/json") {
+        return [pscustomobject]@{ Allowed = $false; Reason = "The request must have Content-Type application/json." }
+    }
+
+    return [pscustomobject]@{ Allowed = $true; Reason = "" }
+}
+
 function Test-UiScanRunning {
     if ($script:ScanJob -and $script:ScanJob.State -in @("Running", "NotStarted")) {
         return $true
@@ -366,7 +397,7 @@ function Get-UiIndexHtml {
     scanButton.addEventListener('click', async () => {
       scanButton.disabled = true;
       message.textContent = 'Starting scan...';
-      await fetch('/api/scan', { method: 'POST' });
+      await fetch('/api/scan', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
       await refreshStatus();
     });
 
@@ -414,7 +445,13 @@ try {
                         Send-UiResponse -Context $context -StatusCode 405 -Body "Method not allowed."
                     }
                     else {
-                        Send-UiResponse -Context $context -ContentType "application/json; charset=utf-8" -Body (ConvertTo-JsonResponse -Value (Start-UiScan))
+                        $scanRequest = Test-UiScanRequest -Origin $context.Request.Headers["Origin"] -ContentType $context.Request.ContentType -Port $Port
+                        if (-not $scanRequest.Allowed) {
+                            Send-UiResponse -Context $context -StatusCode 403 -Body "Forbidden. $($scanRequest.Reason)"
+                        }
+                        else {
+                            Send-UiResponse -Context $context -ContentType "application/json; charset=utf-8" -Body (ConvertTo-JsonResponse -Value (Start-UiScan))
+                        }
                     }
                     break
                 }
