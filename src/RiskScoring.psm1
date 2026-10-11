@@ -153,6 +153,42 @@ function Test-M365PersonalDomain {
     return @($PersonalDomains | ForEach-Object { $_.ToLowerInvariant() }) -contains $normalized
 }
 
+function Get-M365TargetAddress {
+    [CmdletBinding()]
+    param(
+        [Parameter()]
+        [string]$Target
+    )
+
+    # Returns the lower-case mail address inside a forwarding target, or $null if there is none.
+    # An address in angle brackets wins over any display text in front of it.
+    if ([string]::IsNullOrWhiteSpace($Target)) {
+        return $null
+    }
+
+    $clean = $Target.Trim()
+    if ($clean -match "SMTP:([^>\s]+@[^>\s]+)") {
+        $clean = $Matches[1]
+    }
+    elseif ($clean -match "<([^<>\s]+@[^<>\s]+)>") {
+        $clean = $Matches[1]
+    }
+    elseif ($clean -match "([^<>\s]+@[^<>\s]+)") {
+        $clean = $Matches[1]
+    }
+
+    $mailAddress = $null
+    if ([System.Net.Mail.MailAddress]::TryCreate($clean, [ref]$mailAddress)) {
+        return $mailAddress.Address.ToLowerInvariant()
+    }
+
+    if ($clean -like "*@*") {
+        return $clean.ToLowerInvariant()
+    }
+
+    return $null
+}
+
 function Test-M365ApprovedException {
     [CmdletBinding()]
     param(
@@ -172,8 +208,14 @@ function Test-M365ApprovedException {
 
     $today = (Get-Date).Date
     $normalizedUser = $UserPrincipalName.ToLowerInvariant()
-    $normalizedTarget = $Target.ToLowerInvariant()
-    $targetDomain = Get-M365TargetDomain -Target $Target
+    $normalizedTarget = $Target.Trim().ToLowerInvariant()
+    $targetAddress = Get-M365TargetAddress -Target $Target
+    $targetDomain = if ($targetAddress) {
+        $targetAddress.Substring($targetAddress.LastIndexOf("@") + 1)
+    }
+    else {
+        Get-M365TargetDomain -Target $Target
+    }
 
     foreach ($exception in $ApprovedExceptions) {
         $exceptionUser = [string]$exception.UserPrincipalName
@@ -186,24 +228,46 @@ function Test-M365ApprovedException {
             continue
         }
 
-        # A blank ExpirationDate means the exception does not expire. A date that cannot be read
-        # fails closed: the exception is skipped instead of being approved indefinitely.
+        # A blank or whitespace-only ExpirationDate means the exception does not expire.
+        # Any other value must be exactly yyyy-MM-dd (a date, no time, no offset), read the same way
+        # under every culture. A value in any other form fails closed: the exception is skipped,
+        # so it never approves anything. The exception is valid through the end of its expiry day.
         $expirationText = [string]$exception.ExpirationDate
         if (-not [string]::IsNullOrWhiteSpace($expirationText)) {
             $expires = [datetime]::MinValue
-            if (-not [datetime]::TryParse($expirationText, [ref]$expires) -or $expires.Date -lt $today) {
+            $isReadable = [datetime]::TryParseExact(
+                $expirationText,
+                "yyyy-MM-dd",
+                [System.Globalization.CultureInfo]::InvariantCulture,
+                [System.Globalization.DateTimeStyles]::None,
+                [ref]$expires)
+            if (-not $isReadable -or $expires.Date -lt $today) {
                 continue
             }
         }
 
-        $normalizedExceptionTarget = $exceptionTarget.ToLowerInvariant()
+        $normalizedExceptionTarget = $exceptionTarget.Trim().ToLowerInvariant()
         if ($normalizedExceptionTarget -in @("*", "any")) {
             return $true
         }
 
-        $exceptionDomain = Get-M365TargetDomain -Target $exceptionTarget
-        if ($normalizedExceptionTarget -eq $normalizedTarget -or
-            ($targetDomain -and $exceptionDomain -and $targetDomain -eq $exceptionDomain)) {
+        if ($normalizedExceptionTarget.Contains("@")) {
+            # An ApprovedTarget with an at sign approves that exact address and nothing else.
+            $exceptionAddress = Get-M365TargetAddress -Target $exceptionTarget
+            if ($exceptionAddress -and $targetAddress -and $exceptionAddress -eq $targetAddress) {
+                return $true
+            }
+            continue
+        }
+
+        # No at sign: a bare domain. It approves any address at exactly that domain, not its subdomains.
+        # A target that has no address in it (for example a recipient identity) must match the text exactly.
+        if ($targetDomain) {
+            if ($targetDomain -eq $normalizedExceptionTarget) {
+                return $true
+            }
+        }
+        elseif ($normalizedTarget -eq $normalizedExceptionTarget) {
             return $true
         }
     }
