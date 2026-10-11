@@ -7,7 +7,7 @@ Metadata-only Microsoft 365 forwarding monitoring for internal IT and security v
 
 This tool detects mailbox forwarding, inbox rules that forward or redirect, external and personal forwarding targets, and abnormal outbound email volume using metadata only. It generates local JSON/CSV output and a static HTML dashboard.
 
-I wrote it because mail forwarding to an outside address is the quietest way data leaves a small company, and the admin center gives you no single place to see it. One scheduled run a day, one page to read.
+I wrote it because mail forwarding to an outside address is the quietest way data leaves a small company, and the admin center gives you no single place to see it. It runs on a schedule and leaves one page to read.
 
 ## Privacy First
 
@@ -106,11 +106,12 @@ Update:
 - `InternalDomains`
 - `PersonalDomains`
 - Thresholds and business hours
+- `BusinessHoursTimeZone` (optional; the machine's own zone when absent)
 - `OutputPath`
 
 Keep `PrivacyMode` set to `true`.
 
-Approved exceptions are configured in `config/approved-exceptions.csv`. `ApprovedTarget` can be a specific address, a domain-matching address, or `*` for a user-wide exception. Use `*` sparingly, such as for an owner-approved exception.
+Approved exceptions are configured in `config/approved-exceptions.csv`. `ApprovedTarget` is one of three things: a full address, which approves only that address; a bare domain written without an at sign, which approves any address at exactly that domain; or `*`, which approves everything for that user. Use `*` sparingly, such as for an owner-approved exception. `ExpirationDate` is written as `yyyy-MM-dd`, or left blank for an exception that does not expire. A date in any other format is treated as already expired.
 
 Outbound attention settings are also configurable:
 
@@ -157,7 +158,7 @@ Build the image:
 docker build -t m365-forwarding-monitor:local .
 ```
 
-On Apple Silicon or other ARM hosts, Docker may run the PowerShell image through emulation. If Docker reports a platform mismatch, rebuild the image locally with `docker build -t m365-forwarding-monitor:local .`.
+On Apple Silicon or other ARM hosts, Docker may run the PowerShell image through emulation. If Docker reports a platform mismatch, rebuild the image locally with the same command.
 
 Run interactively with device-code authentication:
 
@@ -238,6 +239,10 @@ Open `output/dashboard.html` in a browser. Review high and critical findings fir
 
 The dashboard displays no email content, subjects, previews, or attachments.
 
+If a collector could not check some users, the dashboard opens with a warning and `summary.json` lists them under `CollectionFailures`; `summary.csv` carries the same counts as columns. An enabled account with no mailbox, such as an unlicensed user, shows up in that list because the mailbox read fails for it. If every user failed, or the user list or the message trace could not be read at all, the run stops with an error and leaves the previous output in place rather than reporting a clean tenant it never saw. A message trace that hit the 5,000-row limit sets `TraceTruncated` on the summary and in the dashboard.
+
+Output files are written to hidden temporary files in `output/` and moved into place together at the end of the run, with the dashboard last, so a reader never sees a half-updated set. If one of them is read-only, for example a CSV held open in a spreadsheet on Windows, the run stops before replacing anything.
+
 ## Troubleshooting
 
 - Check `output/errors.log`.
@@ -269,7 +274,7 @@ Invoke-Pester -Path ./tests
 Invoke-ScriptAnalyzer -Path ./src -Recurse -Settings ./PSScriptAnalyzerSettings.psd1
 ```
 
-CI runs the same two commands on Windows and Ubuntu for every push. The analyzer settings file lists the rules that are switched off and why. Nothing in `config/settings.json`, `config/approved-exceptions.csv` or `output/` is ever committed; the `.gitignore` enforces that.
+CI runs the analyzer over `src`, `tests`, `samples` and the root scripts, then the Pester suite, on Windows and Ubuntu for every push, with the analyzer pinned to one version. The settings file lists the rules that are switched off and why. The live settings, the live exceptions file and `output/` are listed in `.gitignore` so a routine `git add` cannot pick them up.
 
 ## Optional Future Output
 
