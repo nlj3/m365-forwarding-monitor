@@ -15,7 +15,7 @@ function Get-M365OutboundMetadataCounts {
     $endDate = Get-Date
     $startDate = $endDate.AddHours(-1 * [int]$Settings.LookbackHours)
     $internalDomains = @($Settings.InternalDomains | ForEach-Object { $_.ToLowerInvariant() })
-    $results = New-Object System.Collections.Generic.List[object]
+    $results = [System.Collections.Generic.List[object]]::new()
 
     $traces = Invoke-M365CallWithRetry -OperationName "Get-MessageTraceV2 outbound metadata" -OutputPath $OutputPath -ScriptBlock {
         Get-MessageTraceV2 -StartDate $startDate -EndDate $endDate -ErrorAction Stop |
@@ -27,10 +27,10 @@ function Get-M365OutboundMetadataCounts {
     }
 
     $externalOutbound = @($traces | Where-Object {
-        $sender = [string]$_.SenderAddress
+        $senderAddress = [string]$_.SenderAddress
         $recipient = [string]$_.RecipientAddress
         $recipientDomain = Get-M365TargetDomain -Target $recipient
-        $sender -like "*@*" -and
+        $senderAddress -like "*@*" -and
         $recipient -like "*@*" -and
         -not ($internalDomains -contains $recipientDomain)
     })

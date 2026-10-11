@@ -18,7 +18,7 @@ function Get-M365MessageRuleForwarding {
     )
 
     $detectedAt = (Get-Date).ToString("o")
-    $results = New-Object System.Collections.Generic.List[object]
+    $results = [System.Collections.Generic.List[object]]::new()
 
     foreach ($user in $Users) {
         $upn = [string]$user.UserPrincipalName

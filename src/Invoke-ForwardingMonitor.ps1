@@ -87,11 +87,11 @@ function Update-M365OutboundBaseline {
     $retentionDays = if ($Settings.PSObject.Properties.Name -contains "BaselineRetentionDays") { [int]$Settings.BaselineRetentionDays } else { 90 }
     $cutoff = (Get-Date).AddDays(-1 * $retentionDays)
 
-    $currentRecords = New-Object System.Collections.Generic.List[object]
+    $currentRecords = [System.Collections.Generic.List[object]]::new()
     foreach ($row in $OutboundCounts) {
-        $sender = [string]$row.SenderAddress
+        $senderAddress = [string]$row.SenderAddress
         $prior = @($history | Where-Object {
-            $_.SenderAddress -eq $sender -and
+            $_.SenderAddress -eq $senderAddress -and
             $_.ExternalSentCount -ne $null -and
             ([datetime]$_.DetectedAt) -ge $cutoff
         })

@@ -127,9 +127,9 @@ function Get-UiAuthChallenge {
     )
 
     foreach ($pattern in $patterns) {
-        $matches = [regex]::Matches($ScanLog, $pattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor [System.Text.RegularExpressions.RegexOptions]::Singleline)
-        if ($matches.Count -gt 0) {
-            $match = $matches[$matches.Count - 1]
+        $challengeMatches = [regex]::Matches($ScanLog, $pattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor [System.Text.RegularExpressions.RegexOptions]::Singleline)
+        if ($challengeMatches.Count -gt 0) {
+            $match = $challengeMatches[$challengeMatches.Count - 1]
             return [pscustomobject]@{
                 Url = $match.Groups["Url"].Value
                 Code = $match.Groups["Code"].Value

@@ -186,11 +186,14 @@ function Test-M365ApprovedException {
             continue
         }
 
-        $expires = $null
-        if (-not [string]::IsNullOrWhiteSpace([string]$exception.ExpirationDate) -and
-            [datetime]::TryParse([string]$exception.ExpirationDate, [ref]$expires) -and
-            $expires.Date -lt $today) {
-            continue
+        # A blank ExpirationDate means the exception does not expire. A date that cannot be read
+        # fails closed: the exception is skipped instead of being approved indefinitely.
+        $expirationText = [string]$exception.ExpirationDate
+        if (-not [string]::IsNullOrWhiteSpace($expirationText)) {
+            $expires = [datetime]::MinValue
+            if (-not [datetime]::TryParse($expirationText, [ref]$expires) -or $expires.Date -lt $today) {
+                continue
+            }
         }
 
         $normalizedExceptionTarget = $exceptionTarget.ToLowerInvariant()

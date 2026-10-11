@@ -10,7 +10,7 @@ function Get-M365MonitorUsers {
 
     $users = Invoke-M365CallWithRetry -OperationName "Graph users list" -OutputPath $OutputPath -ScriptBlock {
         Write-Host "Listing users with Microsoft Graph metadata only..."
-        $allUsers = New-Object System.Collections.Generic.List[object]
+        $allUsers = [System.Collections.Generic.List[object]]::new()
         $uri = 'https://graph.microsoft.com/v1.0/users?$select=id,displayName,userPrincipalName,mail,accountEnabled,userType&$top=999'
 
         while ($uri) {
