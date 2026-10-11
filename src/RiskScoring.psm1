@@ -285,12 +285,29 @@ function Get-M365OutboundRiskLevel {
     return "Low"
 }
 
+function Protect-M365CsvText {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
+
+    # Spreadsheet programs read a cell that starts with = + - @ tab, carriage return or line feed as a
+    # formula. A leading apostrophe makes the cell plain text. Line breaks inside a cell become one space.
+    if ($Text -match '^[=+\-@\t\r\n]') { $Text = "'" + $Text }
+    return ($Text -replace '[\r\n]+', ' ')
+}
+
 function ConvertTo-M365CsvSafeValue {
     [CmdletBinding()]
     param([Parameter()][object]$Value)
 
     if ($null -eq $Value) { return $null }
-    if ($Value -is [array]) { return ($Value -join "; ") }
+    if ($Value -is [array]) {
+        $parts = foreach ($item in $Value) {
+            $safeItem = ConvertTo-M365CsvSafeValue -Value $item
+            if ($null -eq $safeItem) { '' } else { [string]$safeItem }
+        }
+        return ($parts -join "; ")
+    }
+    if ($Value -is [string]) { return (Protect-M365CsvText -Text $Value) }
     return $Value
 }
 

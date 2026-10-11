@@ -55,10 +55,34 @@ function Add-M365Property {
     }
 }
 
+function Write-M365JsonReport {
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object]$InputObject,
+
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [Parameter()]
+        [int]$Depth = 8
+    )
+
+    # An empty collection sends nothing down the pipeline, so ConvertTo-Json | Set-Content would not
+    # touch the file and an earlier run's report would stay in place. Write an empty array instead.
+    if (@($InputObject).Count -eq 0) {
+        Set-Content -Path $Path -Value "[]" -Encoding UTF8
+        return
+    }
+
+    $InputObject | ConvertTo-Json -Depth $Depth | Set-Content -Path $Path -Encoding UTF8
+}
+
 function Update-M365OutboundBaseline {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
         [object[]]$OutboundCounts,
 
         [Parameter(Mandatory)]
@@ -128,9 +152,7 @@ function Update-M365OutboundBaseline {
     $retainedHistory = @($history | Where-Object {
         $_.DetectedAt -and ([datetime]$_.DetectedAt) -ge $cutoff
     })
-    @($retainedHistory + $currentRecords) |
-        ConvertTo-Json -Depth 8 |
-        Set-Content -Path $historyPath -Encoding UTF8
+    Write-M365JsonReport -InputObject @($retainedHistory + $currentRecords) -Path $historyPath
 }
 
 $settingsFile = Resolve-M365MonitorPath -Path $SettingsPath
@@ -194,13 +216,34 @@ try {
         AboveBaselineOutboundCount        = @($outboundCounts | Where-Object { $_.IsAboveBaseline }).Count
     }
 
-    $allForwarding | ConvertTo-Json -Depth 8 | Set-Content -Path (Join-Path $outputPath "forwarding-findings.json") -Encoding UTF8
-    $outboundCounts | ConvertTo-Json -Depth 8 | Set-Content -Path (Join-Path $outputPath "outbound-metadata-counts.json") -Encoding UTF8
+    Write-M365JsonReport -InputObject $allForwarding -Path (Join-Path $outputPath "forwarding-findings.json")
+    Write-M365JsonReport -InputObject $outboundCounts -Path (Join-Path $outputPath "outbound-metadata-counts.json")
     $summary | ConvertTo-Json -Depth 5 | Set-Content -Path (Join-Path $outputPath "summary.json") -Encoding UTF8
 
-    $allForwarding | Export-Csv -Path (Join-Path $outputPath "forwarding-findings.csv") -NoTypeInformation
+    # CSV only: text fields such as rule names, display names and forwarding targets are set by users
+    # or by outside senders, so each string goes through ConvertTo-M365CsvSafeValue. The JSON keeps raw values.
+    # One fixed column set for both kinds of finding, so the header does not depend on which kind comes first.
+    # Columns shared by both come first, then the mailbox-only column, then the inbox-rule columns.
+    $findingColumns = @(
+        "UserPrincipalName", "DisplayName", "ForwardingType", "ForwardTarget", "TargetDomain", "IsExternal",
+        "IsPersonalDomain", "ApprovedException", "RiskLevel", "DetectedAt",
+        "DeliverToMailboxAndForward", "RuleName", "RuleId", "RuleEnabled"
+    )
+    $allForwarding |
+        ForEach-Object {
+            $csvRow = $_.PSObject.Copy()
+            foreach ($property in $csvRow.PSObject.Properties) {
+                if ($property.Value -is [string]) { $property.Value = ConvertTo-M365CsvSafeValue $property.Value }
+            }
+            $csvRow
+        } |
+        Select-Object -Property $findingColumns |
+        Export-Csv -Path (Join-Path $outputPath "forwarding-findings.csv") -NoTypeInformation
     $outboundCounts |
-        Select-Object Date, UserPrincipalName, SenderAddress, ExternalSentCount, UniqueExternalRecipientCount,
+        Select-Object Date,
+            @{ Name = "UserPrincipalName"; Expression = { ConvertTo-M365CsvSafeValue $_.UserPrincipalName } },
+            @{ Name = "SenderAddress"; Expression = { ConvertTo-M365CsvSafeValue $_.SenderAddress } },
+            ExternalSentCount, UniqueExternalRecipientCount,
             @{ Name = "TopExternalDomains"; Expression = { ConvertTo-M365CsvSafeValue $_.TopExternalDomains } },
             AfterHoursCount, BaselineAverage, BaselineSampleCount, BaselineMultiplier, IsAboveBaseline, CountDeltaFromBaseline, RiskLevel, DetectedAt |
         Export-Csv -Path (Join-Path $outputPath "outbound-metadata-counts.csv") -NoTypeInformation
