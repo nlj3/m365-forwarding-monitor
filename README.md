@@ -1,8 +1,13 @@
 # Microsoft 365 Forwarding Monitor
 
+[![ci](https://github.com/nlj3/m365-forwarding-monitor/actions/workflows/ci.yml/badge.svg)](https://github.com/nlj3/m365-forwarding-monitor/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Metadata-only Microsoft 365 forwarding monitoring for internal IT and security visibility.
 
 This tool detects mailbox forwarding, inbox rules that forward or redirect, external and personal forwarding targets, and abnormal outbound email volume using metadata only. It generates local JSON/CSV output and a static HTML dashboard.
+
+I wrote it because mail forwarding to an outside address is the quietest way data leaves a small company, and the admin center gives you no single place to see it. One scheduled run a day, one page to read.
 
 ## Privacy First
 
@@ -242,6 +247,19 @@ The dashboard displays no email content, subjects, previews, or attachments.
 - The per-user average is based on outbound external metadata counts, not confirmed manual forward actions.
 - Baselines need several scheduled runs before they become meaningful.
 - This tool detects forwarding configuration risk and abnormal outbound volume; it is not an email content inspection tool.
+
+## Development
+
+The scoring rules live in `src/RiskScoring.psm1` and have a Pester suite that runs with no tenant, no network and no credentials:
+
+```powershell
+Install-Module Pester -MaximumVersion 5.99 -Scope CurrentUser
+Install-Module PSScriptAnalyzer -Scope CurrentUser
+Invoke-Pester -Path ./tests
+Invoke-ScriptAnalyzer -Path ./src -Recurse -Settings ./PSScriptAnalyzerSettings.psd1
+```
+
+CI runs the same two commands on Windows and Ubuntu for every push. The analyzer settings file lists the rules that are switched off and why. Nothing in `config/settings.json`, `config/approved-exceptions.csv` or `output/` is ever committed; the `.gitignore` enforces that.
 
 ## Optional Future Output
 

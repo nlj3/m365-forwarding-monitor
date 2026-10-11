@@ -1,0 +1,58 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Pester and PSScriptAnalyzer
+        run: |
+          Install-Module Pester -MaximumVersion 5.99 -Force -Scope CurrentUser -SkipPublisherCheck
+          Install-Module PSScriptAnalyzer -RequiredVersion 1.25.0 -Force -Scope CurrentUser
+
+      - name: Lint with PSScriptAnalyzer
+        run: |
+          $settings = './PSScriptAnalyzerSettings.psd1'
+          $findings = @()
+          foreach ($folder in 'src', 'tests', 'samples') {
+            $findings += @(Invoke-ScriptAnalyzer -Path $folder -Recurse -Severity Error, Warning -Settings $settings)
+          }
+          foreach ($file in Get-ChildItem -Path . -Filter *.ps1 -File) {
+            $findings += @(Invoke-ScriptAnalyzer -Path $file.FullName -Severity Error, Warning -Settings $settings)
+          }
+          $findings | Format-Table RuleName, Severity, ScriptName, Line, Message -AutoSize | Out-String -Width 200
+          if ($findings.Count -gt 0) { throw "$($findings.Count) PSScriptAnalyzer finding(s)." }
+
+      - name: Run Pester tests
+        run: |
+          Import-Module Pester -MinimumVersion 5.0.0
+          $config = New-PesterConfiguration
+          $config.Run.Path = './tests'
+          $config.Run.Exit = $true
+          $config.Output.Verbosity = 'Detailed'
+          $config.TestResult.Enabled = $true
+          $config.TestResult.OutputFormat = 'NUnitXml'
+          $config.TestResult.OutputPath = 'testResults.xml'
+          Invoke-Pester -Configuration $config
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.os }}
+          path: testResults.xml
