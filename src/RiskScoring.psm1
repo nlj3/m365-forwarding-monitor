@@ -349,6 +349,53 @@ function Get-M365OutboundRiskLevel {
     return "Low"
 }
 
+function Get-M365BusinessHoursTimeZone {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [object]$Settings
+    )
+
+    # BusinessHoursTimeZone is an IANA id (America/Chicago) or a Windows id (Central Standard Time).
+    # When the key is missing or blank, the time zone of the computer running the scan is used.
+    $zoneId = $null
+    if ($Settings.PSObject.Properties.Name -contains "BusinessHoursTimeZone") {
+        $zoneId = [string]$Settings.BusinessHoursTimeZone
+    }
+
+    if ([string]::IsNullOrWhiteSpace($zoneId)) {
+        return [System.TimeZoneInfo]::Local
+    }
+
+    try {
+        return [System.TimeZoneInfo]::FindSystemTimeZoneById($zoneId.Trim())
+    }
+    catch {
+        throw "BusinessHoursTimeZone '$zoneId' is not a time zone this computer knows. Use an IANA id such as America/Chicago or a Windows id such as Central Standard Time."
+    }
+}
+
+function Get-M365BusinessHour {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [datetime]$Received,
+
+        [Parameter(Mandatory)]
+        [System.TimeZoneInfo]$TimeZone
+    )
+
+    # Message trace times are UTC. A time with no kind is taken as UTC; a local time is converted to UTC first.
+    $utc = if ($Received.Kind -eq [System.DateTimeKind]::Local) {
+        $Received.ToUniversalTime()
+    }
+    else {
+        [datetime]::SpecifyKind($Received, [System.DateTimeKind]::Utc)
+    }
+
+    return [System.TimeZoneInfo]::ConvertTimeFromUtc($utc, $TimeZone).Hour
+}
+
 function Protect-M365CsvText {
     [CmdletBinding()]
     param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
@@ -384,5 +431,7 @@ Export-ModuleMember -Function @(
     "Test-M365ApprovedException",
     "Get-M365ForwardingRiskLevel",
     "Get-M365OutboundRiskLevel",
+    "Get-M365BusinessHoursTimeZone",
+    "Get-M365BusinessHour",
     "ConvertTo-M365CsvSafeValue"
 )

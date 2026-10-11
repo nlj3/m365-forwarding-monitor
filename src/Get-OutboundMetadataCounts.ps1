@@ -8,8 +8,17 @@ function Get-M365OutboundMetadataCounts {
         [object]$Settings,
 
         [Parameter()]
-        [string]$OutputPath = "./output"
+        [string]$OutputPath = "./output",
+
+        # Receives RowCount and Truncated. Truncated is true when the trace returned as many rows as it was allowed to.
+        [Parameter()]
+        [hashtable]$TraceStatus = @{}
     )
+
+    # Message trace times are UTC. After-hours counting uses the hour in the business time zone.
+    # This throws on an unknown time zone before any call is made.
+    $timeZone = Get-M365BusinessHoursTimeZone -Settings $Settings
+    $resultSize = 5000
 
     $detectedAt = (Get-Date).ToString("o")
     $endDate = Get-Date
@@ -17,9 +26,17 @@ function Get-M365OutboundMetadataCounts {
     $internalDomains = @($Settings.InternalDomains | ForEach-Object { $_.ToLowerInvariant() })
     $results = [System.Collections.Generic.List[object]]::new()
 
-    $traces = Invoke-M365CallWithRetry -OperationName "Get-MessageTraceV2 outbound metadata" -OutputPath $OutputPath -ScriptBlock {
-        Get-MessageTraceV2 -StartDate $startDate -EndDate $endDate -ErrorAction Stop |
+    # One call returns the whole trace. If it fails, the scan has no outbound data, so it throws and the run stops.
+    $traces = Invoke-M365CallWithRetry -OperationName "Get-MessageTraceV2 outbound metadata" -OutputPath $OutputPath -ThrowOnFailure -ScriptBlock {
+        Get-MessageTraceV2 -StartDate $startDate -EndDate $endDate -ResultSize $resultSize -ErrorAction Stop |
             Select-Object Received, SenderAddress, RecipientAddress, Directionality, Status
+    }
+
+    $rowCount = if ($null -eq $traces) { 0 } else { @($traces).Count }
+    $TraceStatus["RowCount"] = $rowCount
+    $TraceStatus["Truncated"] = $rowCount -ge $resultSize
+    if ($TraceStatus["Truncated"]) {
+        Write-M365MonitorError -Message "Message trace returned the maximum of $resultSize rows, so outbound counts may be too low." -OutputPath $OutputPath
     }
 
     if ($null -eq $traces) {
@@ -48,7 +65,7 @@ function Get-M365OutboundMetadataCounts {
         )
 
         $afterHours = @($items | Where-Object {
-            $hour = ([datetime]$_.Received).Hour
+            $hour = Get-M365BusinessHour -Received ([datetime]$_.Received) -TimeZone $timeZone
             $hour -lt [int]$Settings.BusinessHoursStart -or $hour -ge [int]$Settings.BusinessHoursEnd
         }).Count
 

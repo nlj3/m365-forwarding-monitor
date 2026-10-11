@@ -38,6 +38,8 @@
   "BaselineRetentionDays": 90,
   "BusinessHoursStart": 8,
   "BusinessHoursEnd": 18,
+  "BusinessHoursTimeZone": "UTC",
+  "BusinessHoursTimeZoneNote": "The time zone that BusinessHoursStart and BusinessHoursEnd are read in. Message trace times are UTC and are converted to this zone before the hour is taken. Use an IANA id such as America/Chicago or a Windows id such as Central Standard Time. If this key is removed, the time zone of the computer running the scan is used.",
   "OutputPath": "./output",
   "PrivacyMode": true
 }
