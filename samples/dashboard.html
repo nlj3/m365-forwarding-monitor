@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>M365 Forwarding Monitor</title>
+  <style>
+    :root { color-scheme: light; --bg:#f6f7f9; --panel:#ffffff; --ink:#1f2933; --muted:#667085; --line:#d7dde5; --critical:#b42318; --high:#b54708; --medium:#a15c07; --low:#2f6b45; --exception:#2559a7; }
+    body { margin:0; font-family: "Segoe UI", Arial, sans-serif; background:var(--bg); color:var(--ink); }
+    header { padding:28px 36px 16px; background:#ffffff; border-bottom:1px solid var(--line); }
+    h1 { margin:0 0 8px; font-size:28px; font-weight:650; letter-spacing:0; }
+    header p { margin:0; color:var(--muted); max-width:920px; line-height:1.45; }
+    main { padding:24px 36px 40px; }
+    .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); gap:14px; margin-bottom:22px; }
+    .card { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:16px; min-height:82px; box-sizing:border-box; }
+    .card span { display:block; color:var(--muted); font-size:13px; margin-bottom:10px; }
+    .card strong { display:block; font-size:30px; line-height:1; }
+    section.table-panel { margin-top:18px; background:var(--panel); border:1px solid var(--line); border-radius:8px; overflow:hidden; }
+    h2 { font-size:17px; margin:0; padding:16px 18px; border-bottom:1px solid var(--line); }
+    table { width:100%; border-collapse:collapse; font-size:14px; }
+    th, td { padding:11px 14px; border-bottom:1px solid #edf0f4; text-align:left; vertical-align:top; }
+    th { color:#344054; background:#fbfcfd; font-size:12px; text-transform:uppercase; letter-spacing:.04em; }
+    tr:last-child td { border-bottom:none; }
+    .badge { display:inline-block; min-width:68px; text-align:center; padding:4px 8px; border-radius:999px; color:#fff; font-size:12px; font-weight:650; }
+    .Critical { background:var(--critical); } .High { background:var(--high); } .Medium { background:var(--medium); } .Low { background:var(--low); } .Exception, .Approved { background:var(--exception); }
+    .empty { color:var(--muted); text-align:center; padding:22px; }
+    footer { color:var(--muted); font-size:12px; padding:0 36px 26px; }
+    @media (max-width: 720px) { header, main, footer { padding-left:18px; padding-right:18px; } table { display:block; overflow-x:auto; white-space:nowrap; } }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Microsoft 365 Forwarding Monitor</h1>
+    <p>Generated 2026-10-11 16:12:25 -07:00. Metadata-only dashboard: no email bodies, subjects, message previews, attachment contents, or individual message content are collected or displayed.</p>
+  </header>
+  <main>
+    <div class="cards">
+      <section class='card'><span>Total users scanned</span><strong>8</strong></section>
+      <section class='card'><span>Mailbox forwarding</span><strong>2</strong></section>
+      <section class='card'><span>Inbox-rule forwarding</span><strong>2</strong></section>
+      <section class='card'><span>External forwarding</span><strong>4</strong></section>
+      <section class='card'><span>Personal-domain forwarding</span><strong>1</strong></section>
+      <section class='card'><span>Configured exceptions</span><strong>1</strong></section>
+      <section class='card'><span>High/Critical risks</span><strong>3</strong></section>
+      <section class='card'><span>Abnormal outbound senders</span><strong>1</strong></section>
+      <section class='card'><span>Above personal average</span><strong>1</strong></section>
+    </div>
+    <section class="table-panel">
+      <h2>Top Risky Users</h2>
+      <table>
+        <thead><tr><th>User</th><th>Type</th><th>Target</th><th>Domain</th><th>Risk</th><th>Detected</th></tr></thead>
+        <tbody><tr><td>priya.nair@contoso.com</td><td>InboxRuleRedirect</td><td>priya.nair.home@personal-mail.example.com</td><td>personal-mail.example.com</td><td><span class='badge Critical'>Critical</span></td><td>2026-10-11T16:12:25.5102110-07:00</td></tr>
+<tr><td>jordan.reyes@contoso.com</td><td>InboxRuleForward</td><td>invoices@vendor.example.com</td><td>vendor.example.com</td><td><span class='badge High'>High</span></td><td>2026-10-11T16:12:25.5102110-07:00</td></tr>
+<tr><td>sam.okafor@contoso.com</td><td>MailboxForwarding</td><td>reports@analytics.example.com</td><td>analytics.example.com</td><td><span class='badge High'>High</span></td><td>2026-10-11T16:12:25.5102110-07:00</td></tr></tbody>
+      </table>
+    </section>
+    <section class="table-panel">
+      <h2>Top External Domains</h2>
+      <table>
+        <thead><tr><th>Domain</th><th>Forwarding Findings</th></tr></thead>
+        <tbody><tr><td>analytics.example.com</td><td>1</td></tr>
+<tr><td>partner.example.com</td><td>1</td></tr>
+<tr><td>personal-mail.example.com</td><td>1</td></tr>
+<tr><td>vendor.example.com</td><td>1</td></tr></tbody>
+      </table>
+    </section>
+    <section class="table-panel">
+      <h2>Abnormal Outbound Metadata Counts</h2>
+      <table>
+        <thead><tr><th>Sender</th><th>External Sent</th><th>Unique Recipients</th><th>Personal Avg</th><th>Delta</th><th>Samples</th><th>Above Avg</th><th>Top Domains</th><th>After Hours</th><th>Risk</th></tr></thead>
+        <tbody><tr><td>taylor.moreau@contoso.com</td><td>62</td><td>47</td><td>22.4</td><td>39.6</td><td>6</td><td>True</td><td>analytics.example.com:30; partner.example.com:19; vendor.example.com:13</td><td>6</td><td><span class='badge Medium'>Medium</span></td></tr></tbody>
+      </table>
+    </section>
+  </main>
+  <footer>Detection only. Review findings before taking administrative action.</footer>
+</body>
+</html>

@@ -29,6 +29,16 @@ It does not request `Mail.Read` or `Mail.ReadWrite`. It does not read or store e
 - Flags external forwarding, personal-domain forwarding, approved exceptions, and outbound volume anomalies.
 - Writes local JSON/CSV metadata and a static dashboard.
 
+## What The Dashboard Looks Like
+
+![The dashboard rendered from sample data: summary counts, the riskiest users, and the external domains they forward to](docs/dashboard.png)
+
+This image comes from `samples/dashboard.html`, which is built from made-up contoso.com users by `samples/New-SampleDashboard.ps1`. No tenant is needed to regenerate it:
+
+```powershell
+pwsh -NoProfile -File ./samples/New-SampleDashboard.ps1
+```
+
 ## What It Intentionally Does Not Do
 
 - Does not read email body text.
