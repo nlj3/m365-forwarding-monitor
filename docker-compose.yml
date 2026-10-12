@@ -7,6 +7,8 @@ services:
       context: .
     image: m365-forwarding-monitor:local
     container_name: m365-forwarding-monitor
+    # A fixed hostname, so a lock left by a killed container is recognized as this computer's and taken over at once.
+    hostname: m365-forwarding-monitor
     stdin_open: true
     tty: true
     environment:
