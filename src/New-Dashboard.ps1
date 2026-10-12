@@ -61,6 +61,10 @@ function Get-M365DashboardWarningHtml {
         $lines.Add("The outbound baseline history could not be read, so this run compared outbound counts with no history and left the file as it was.")
     }
 
+    if ($Summary.PSObject.Properties.Name -contains "PreviousReportUnreadable" -and $Summary.PreviousReportUnreadable -eq $true) {
+        $lines.Add("The previous forwarding-findings.json could not be read, so forwards found by earlier scans could not be kept, and accounts reported without a mailbox are counted as failed reads in this run.")
+    }
+
     if ($lines.Count -eq 0) { return "" }
 
     $items = ($lines | ForEach-Object { "<li>$_</li>" }) -join "`n        "

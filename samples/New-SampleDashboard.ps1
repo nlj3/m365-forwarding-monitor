@@ -182,6 +182,7 @@ $summary = [pscustomobject]@{
     AboveBaselineOutboundCount    = @($outboundCounts | Where-Object { $_.IsAboveBaseline }).Count
     TraceTruncated                = $false
     BaselineDegraded              = $false
+    PreviousReportUnreadable      = $false
     UsersWithoutMailbox           = [pscustomobject]@{ Count = 0; UserPrincipalNames = @() }
     CollectionFailures            = [pscustomobject]@{
         MailboxForwarding = [pscustomobject]@{ Count = 0; UserPrincipalNames = @() }
