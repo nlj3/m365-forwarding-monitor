@@ -18,7 +18,11 @@ function Get-M365MessageRuleForwarding {
 
         # Receives the user principal name of every user whose inbox rules could not be read.
         [Parameter()]
-        [System.Collections.Generic.List[string]]$FailedUsers = [System.Collections.Generic.List[string]]::new()
+        [System.Collections.Generic.List[string]]$FailedUsers = [System.Collections.Generic.List[string]]::new(),
+
+        # Receives the user principal name of every user who has no mailbox. That is not a failure.
+        [Parameter()]
+        [System.Collections.Generic.List[string]]$NoMailboxUsers = [System.Collections.Generic.List[string]]::new()
     )
 
     $detectedAt = (Get-Date).ToString("o")
@@ -32,12 +36,17 @@ function Get-M365MessageRuleForwarding {
 
         # Rules that cannot be read are counted, never skipped silently: a scan that cannot see must not look clean.
         try {
-            $rules = Invoke-M365CallWithRetry -OperationName "Graph messageRules $upn" -OutputPath $OutputPath -ThrowOnFailure -ScriptBlock {
+            $rules = Invoke-M365CallWithRetry -OperationName "Graph messageRules $upn" -OutputPath $OutputPath -ThrowOnFailure -NoRetryPattern (Get-M365NoMailboxPattern -Source InboxRules) -ScriptBlock {
                 Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/users/$upn/mailFolders/inbox/messageRules" -ErrorAction Stop
             }
         }
         catch {
-            $FailedUsers.Add($upn)
+            if (Test-M365NoMailboxError -ErrorRecord $_ -Source InboxRules) {
+                $NoMailboxUsers.Add($upn)
+            }
+            else {
+                $FailedUsers.Add($upn)
+            }
             continue
         }
 

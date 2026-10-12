@@ -19,3 +19,6 @@ if (-not (Test-Path -LiteralPath $settingsPath)) {
     -SettingsPath $settingsPath `
     -ApprovedExceptionsPath $exceptionsPath `
     -UseDeviceAuthentication:$useDeviceAuth
+
+# Pass the monitor's exit code on: 0 clean run, 2 partial scan. A stopped run throws and exits 1 on its own.
+if ($LASTEXITCODE) { exit $LASTEXITCODE }

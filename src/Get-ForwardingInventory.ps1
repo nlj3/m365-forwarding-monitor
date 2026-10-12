@@ -18,7 +18,11 @@ function Get-M365ForwardingInventory {
 
         # Receives the user principal name of every user whose mailbox could not be read.
         [Parameter()]
-        [System.Collections.Generic.List[string]]$FailedUsers = [System.Collections.Generic.List[string]]::new()
+        [System.Collections.Generic.List[string]]$FailedUsers = [System.Collections.Generic.List[string]]::new(),
+
+        # Receives the user principal name of every user who has no mailbox. That is not a failure.
+        [Parameter()]
+        [System.Collections.Generic.List[string]]$NoMailboxUsers = [System.Collections.Generic.List[string]]::new()
     )
 
     $detectedAt = (Get-Date).ToString("o")
@@ -32,13 +36,18 @@ function Get-M365ForwardingInventory {
 
         # A mailbox that cannot be read is counted, never skipped silently: a scan that cannot see must not look clean.
         try {
-            $mailbox = Invoke-M365CallWithRetry -OperationName "Get-Mailbox $upn" -OutputPath $OutputPath -ThrowOnFailure -ScriptBlock {
+            $mailbox = Invoke-M365CallWithRetry -OperationName "Get-Mailbox $upn" -OutputPath $OutputPath -ThrowOnFailure -NoRetryPattern (Get-M365NoMailboxPattern -Source Mailbox) -ScriptBlock {
                 Get-Mailbox -Identity $upn -ErrorAction Stop |
                     Select-Object DisplayName, UserPrincipalName, PrimarySmtpAddress, ForwardingAddress, ForwardingSmtpAddress, DeliverToMailboxAndForward
             }
         }
         catch {
-            $FailedUsers.Add($upn)
+            if (Test-M365NoMailboxError -ErrorRecord $_ -Source Mailbox) {
+                $NoMailboxUsers.Add($upn)
+            }
+            else {
+                $FailedUsers.Add($upn)
+            }
             continue
         }
 
