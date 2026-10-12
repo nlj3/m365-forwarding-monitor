@@ -1210,9 +1210,9 @@ Describe 'New-M365ForwardingDashboard warnings' {
         . (Join-Path (Join-Path $PSScriptRoot '..') 'src/New-Dashboard.ps1')
 
         function Get-DashboardText {
-            param([object]$Summary)
+            param([object]$Summary, [object[]]$Findings = @())
             $folder = Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))
-            $path = New-M365ForwardingDashboard -Summary $Summary -ForwardingFindings @() -OutboundCounts @() -OutputPath $folder
+            $path = New-M365ForwardingDashboard -Summary $Summary -ForwardingFindings $Findings -OutboundCounts @() -OutputPath $folder
             return (Get-Content -LiteralPath $path -Raw)
         }
 
@@ -1315,9 +1315,19 @@ Describe 'New-M365ForwardingDashboard warnings' {
         $html | Should -BeLike '*outbound baseline history could not be read*'
     }
 
-    It 'says that forwards found by an earlier scan are kept and marked when users could not be read' {
-        Get-DashboardText -Summary (Get-DashboardSummary -RuleFailed @('c@contoso.com')) | Should -BeLike '*earlier scan*marked not re-checked*'
+    It 'says that forwards found by an earlier scan are kept only when the page shows such forwards, and never when the previous report could not be read' {
+        $kept = [pscustomobject]@{ UserPrincipalName = 'c@contoso.com'; ForwardingType = 'InboxRuleForward'; ForwardTarget = 'c.home@webmail.example.com'
+            TargetDomain = 'webmail.example.com'; IsExternal = $true; RiskLevel = 'Critical'; DetectedAt = '2026-01-05T09:00:00.0000000Z'; NotRechecked = $true; KeptBecause = 'Failed' }
+
+        Get-DashboardText -Summary (Get-DashboardSummary -RuleFailed @('c@contoso.com')) -Findings @($kept) | Should -BeLike '*earlier scan*marked not re-checked*'
+        Get-DashboardText -Summary (Get-DashboardSummary -RuleFailed @('c@contoso.com')) | Should -Not -BeLike '*earlier scan*'
         Get-DashboardText -Summary (Get-DashboardSummary -Truncated $true) | Should -Not -BeLike '*not re-checked*'
+
+        $unreadable = Get-DashboardSummary -RuleFailed @('c@contoso.com')
+        $unreadable | Add-Member -NotePropertyName PreviousReportUnreadable -NotePropertyValue $true
+        $html = Get-DashboardText -Summary $unreadable -Findings @($kept)
+        $html | Should -BeLike '*previous forwarding-findings.json could not be read*'
+        $html | Should -Not -BeLike '*still listed*'
     }
 
     It 'marks a finding kept from an earlier scan as not re-checked in the risky users table, and no other finding' {
@@ -1526,7 +1536,7 @@ Describe 'Invoke-ForwardingMonitor.ps1 run against stubbed Microsoft calls' {
         $expectedFindingColumns = @(
             'UserPrincipalName', 'DisplayName', 'ForwardingType', 'ForwardTarget', 'TargetDomain', 'IsExternal',
             'IsPersonalDomain', 'ApprovedException', 'RiskLevel', 'DetectedAt',
-            'DeliverToMailboxAndForward', 'RuleName', 'RuleId', 'RuleEnabled', 'NotRechecked'
+            'DeliverToMailboxAndForward', 'RuleName', 'RuleId', 'RuleEnabled', 'NotRechecked', 'KeptBecause'
         )
 
         # The stubs stand in for Invoke-MgGraphRequest, Get-Mailbox and Get-MessageTraceV2.
@@ -1539,8 +1549,12 @@ Describe 'Invoke-ForwardingMonitor.ps1 run against stubbed Microsoft calls' {
             if ($Uri.Contains('#')) {
                 throw "Resource not found for the segment '$(($Uri.Split('#')[0] -split '/')[-1])'."
             }
-            if ($Uri -match '/users/(?<upn>[^/]+)/mailFolders/inbox/messageRules$') {
-                $ruleUpn = [System.Uri]::UnescapeDataString($Matches['upn'])
+            if ($Uri -match '/users/(?<id>[^/]+)/mailFolders/inbox/messageRules$') {
+                # Inbox rules are read by object id. The stub turns the id back into the user name the scenario uses.
+                $key = [System.Uri]::UnescapeDataString($Matches['id'])
+                $global:OfflineRun.RuleUris = @($global:OfflineRun.RuleUris | Where-Object { $_ }) + $Uri
+                $ruleUser = @($global:OfflineRun.Users | Where-Object { $_.id -eq $key })[0]
+                $ruleUpn = if ($ruleUser) { $ruleUser.userPrincipalName } else { $key }
                 $global:OfflineRun.RuleCalls = @($global:OfflineRun.RuleCalls | Where-Object { $_ }) + $ruleUpn
                 if ($global:OfflineRun.RulesNoMailbox -contains $ruleUpn) {
                     throw '{"error":{"code":"MailboxNotEnabledForRESTAPI","message":"The mailbox is either inactive, soft-deleted, or is hosted on-premise."}}'
@@ -1601,8 +1615,10 @@ Describe 'Invoke-ForwardingMonitor.ps1 run against stubbed Microsoft calls' {
 
         function Get-OfflineUser {
             param([string]$Name, [string]$DisplayName)
+            # A made-up object id per name, so the inbox rule stub can tell users apart by id as Graph does.
+            $hash = [System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes($Name))
             return @{
-                id                = '00000000-0000-0000-0000-000000000000'
+                id                = '00000000-0000-0000-0000-{0}' -f (-join ($hash[0..5] | ForEach-Object { $_.ToString('x2') }))
                 displayName       = $DisplayName
                 userPrincipalName = "$Name@contoso.com"
                 mail              = "$Name@contoso.com"
@@ -1690,11 +1706,26 @@ Describe 'Invoke-ForwardingMonitor.ps1 run against stubbed Microsoft calls' {
 
         function Get-OutputSnapshot {
             param([string]$Directory)
+            # The scan lock is left out: a scan writes it whenever it holds it, and a held lock cannot be read.
             $snapshot = [ordered]@{}
-            foreach ($file in Get-ChildItem -LiteralPath $Directory -File -Force | Where-Object Name -ne 'errors.log' | Sort-Object Name) {
+            foreach ($file in Get-ChildItem -LiteralPath $Directory -File -Force | Where-Object { $_.Name -notin 'errors.log', '.scan.lock' } | Sort-Object Name) {
                 $snapshot[$file.Name] = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash
             }
             return ($snapshot | ConvertTo-Json -Compress)
+        }
+
+        function Test-ScanLockHeld {
+            param([string]$Directory)
+            # True while some process holds the scan lock: opening it with no sharing fails then.
+            $path = Join-Path $Directory '.scan.lock'
+            if (-not [System.IO.File]::Exists($path)) { return $false }
+            try {
+                ([System.IO.FileStream]::new($path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::None)).Dispose()
+                return $false
+            }
+            catch {
+                return $true
+            }
         }
     }
 
@@ -1765,7 +1796,7 @@ Describe 'Invoke-ForwardingMonitor.ps1 run against stubbed Microsoft calls' {
             @($summary.CollectionFailures.MailboxForwarding.UserPrincipalNames).Count | Should -Be 0
             $scenario.LastResultSize | Should -Be 5000
             @(Get-ChildItem -LiteralPath $outputDir -Force | Where-Object Name -match '\.(tmp|prev)$').Count | Should -Be 0
-            Join-Path $outputDir '.scan.lock' | Should -Not -Exist
+            Test-ScanLockHeld -Directory $outputDir | Should -BeFalse
             Get-Content -Path (Join-Path $outputDir 'dashboard.html') -Raw | Should -Not -BeLike '*Incomplete scan*'
         }
 
@@ -2311,7 +2342,7 @@ Describe 'Invoke-ForwardingMonitor.ps1 run against stubbed Microsoft calls' {
 
         It 'records the stop in errors.log and writes no report file' {
             Get-Content -Path (Join-Path $runRoot 'output/errors.log') -Raw | Should -BeLike "*BusinessHoursTimeZone 'Nowhere/Land'*"
-            @(Get-ChildItem -LiteralPath (Join-Path $runRoot 'output') -File -Force | Where-Object Name -ne 'errors.log').Count | Should -Be 0
+            @(Get-ChildItem -LiteralPath (Join-Path $runRoot 'output') -File -Force | Where-Object { $_.Name -notin 'errors.log', '.scan.lock' }).Count | Should -Be 0
         }
     }
 
@@ -2573,6 +2604,7 @@ Describe 'Invoke-ForwardingMonitor.ps1 run against stubbed Microsoft calls' {
             $kept[0].RiskLevel | Should -BeExactly 'Critical'
             $kept[0].ForwardTarget | Should -BeExactly 'smtp:alice.home@webmail.example.com'
             $kept[0].DetectedAt | Should -Be $aliceOne.DetectedAt
+            $kept[0].KeptBecause | Should -BeExactly 'Failed'
         }
 
         It 'reports alice''s inbox rule once, as read in this run, because the rules call worked' {
@@ -2639,49 +2671,67 @@ Describe 'Invoke-ForwardingMonitor.ps1 run against stubbed Microsoft calls' {
                 Traces = @((Get-OfflineTrace -SenderAddress 'alex.wilber@contoso.com' -Recipient 'a@vendor.example.com')) }
             $outputDir = Invoke-OfflineMonitorRun -Name 'back-to-back' -Scenario $scenario -ExceptionTarget 'nobody@partner.example.com'
             $firstExit = $scenario.ExitCode
-            $lockAfterFirst = [System.IO.File]::Exists((Join-Path $outputDir '.scan.lock'))
+            $heldAfterFirst = Test-ScanLockHeld -Directory $outputDir
             $null = Invoke-OfflineMonitorRun -Name 'back-to-back' -Scenario $scenario -ExceptionTarget 'nobody@partner.example.com'
         }
 
-        It 'runs both to the end and removes the lock after each' {
+        It 'runs both to the end and lets go of the lock after each, leaving the lock file empty' {
             $firstExit | Should -Be 0
-            $lockAfterFirst | Should -BeFalse
+            $heldAfterFirst | Should -BeFalse
             $scenario.ExitCode | Should -Be 0
-            Join-Path $outputDir '.scan.lock' | Should -Not -Exist
+            Test-ScanLockHeld -Directory $outputDir | Should -BeFalse
+            [System.IO.File]::ReadAllText((Join-Path $outputDir '.scan.lock')) | Should -BeExactly ''
             @(Get-Content -LiteralPath (Join-Path $outputDir 'outbound-baseline-history.json') -Raw | ConvertFrom-Json).Count | Should -Be 2
         }
     }
 
-    Context 'when the output folder holds a lock from a scan on another computer that started seven hours ago' {
+    Context 'when the output folder holds a lock file that no process holds' {
         BeforeAll {
+            # What a killed scan leaves: the file and what it wrote, but no process holding it.
             $scenario = @{ Users = @((Get-OfflineUser -Name 'alex.wilber' -DisplayName 'Alex Wilber')); Mailboxes = @{}; Rules = @{}
                 Traces = @((Get-OfflineTrace -SenderAddress 'alex.wilber@contoso.com' -Recipient 'a@vendor.example.com')) }
             $seed = {
                 param($Dir)
-                $started = [datetime]::UtcNow.AddHours(-7).ToString('o', [cultureinfo]::InvariantCulture)
+                $started = [datetime]::UtcNow.AddMinutes(-5).ToString('o', [cultureinfo]::InvariantCulture)
                 [System.IO.File]::WriteAllText((Join-Path $Dir '.scan.lock'), "ProcessId: 4242`nMachineName: other-host.example.com`nStartedAt: $started`n")
             }
-            $outputDir = Invoke-OfflineMonitorRun -Name 'stale-lock' -Scenario $scenario -ExceptionTarget 'nobody@partner.example.com' -Seed $seed
+            $outputDir = Invoke-OfflineMonitorRun -Name 'unheld-lock' -Scenario $scenario -ExceptionTarget 'nobody@partner.example.com' -Seed $seed
         }
 
-        It 'takes the lock over, completes the scan and says so in errors.log' {
+        It 'takes the lock over at once, whatever the file says, and says so in errors.log' {
             $scenario.ExitCode | Should -Be 0
             Join-Path $outputDir 'dashboard.html' | Should -Exist
-            Get-Content -LiteralPath (Join-Path $outputDir 'errors.log') -Raw | Should -BeLike '*Took over the scan lock*process 4242*'
-            Join-Path $outputDir '.scan.lock' | Should -Not -Exist
+            Get-Content -LiteralPath (Join-Path $outputDir 'errors.log') -Raw | Should -BeLike '*Took over the scan lock*process 4242 on other-host.example.com*no longer running*'
+            Test-ScanLockHeld -Directory $outputDir | Should -BeFalse
         }
     }
 
-    Context 'when a scan on another computer is running in the output folder' {
+    Context 'when another scan holds the lock' {
         BeforeAll {
             $users = @((Get-OfflineUser -Name 'alex.wilber' -DisplayName 'Alex Wilber'))
             $good = @{ Users = $users; Mailboxes = @{ 'alex.wilber@contoso.com' = 'smtp:records@partner.example.com' }; Rules = @{}
                 Traces = @((Get-OfflineTrace -SenderAddress 'alex.wilber@contoso.com' -Recipient 'a@vendor.example.com')) }
             $outputDir = Invoke-OfflineMonitorRun -Name 'busy' -Scenario $good -ExceptionTarget 'nobody@partner.example.com'
+            $lockPath = Join-Path $outputDir '.scan.lock'
 
-            $started = [datetime]::UtcNow.AddMinutes(-5)
-            $startedText = $started.ToString('yyyy-MM-ddTHH:mm:ssZ', [cultureinfo]::InvariantCulture)
-            [System.IO.File]::WriteAllText((Join-Path $outputDir '.scan.lock'), "ProcessId: 4242`nMachineName: other-host.example.com`nStartedAt: $($started.ToString('o', [cultureinfo]::InvariantCulture))`n")
+            # Another process holds the lock the way a scan does: open, with no sharing, for as long as it runs.
+            $holderScript = Join-Path $TestDrive 'hold-scan-lock.ps1'
+            Set-Content -LiteralPath $holderScript -Encoding UTF8 -Value @'
+param([string]$LockPath, [string]$ReadyPath)
+$stream = [System.IO.FileStream]::new($LockPath, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+$stream.SetLength(0)
+$text = "ProcessId: $PID`nMachineName: $([System.Environment]::MachineName)`nStartedAt: $([datetime]::UtcNow.ToString('o', [cultureinfo]::InvariantCulture))`n"
+$bytes = [System.Text.Encoding]::UTF8.GetBytes($text)
+$stream.Write($bytes, 0, $bytes.Length)
+$stream.Flush($true)
+[System.IO.File]::WriteAllText($ReadyPath, 'ready')
+Start-Sleep -Seconds 120
+'@
+            $ready = Join-Path $TestDrive 'holder-ready'
+            $holder = [System.Diagnostics.Process]::Start([System.Environment]::ProcessPath, [string[]]@('-NoProfile', '-NonInteractive', '-File', $holderScript, $lockPath, $ready))
+            $deadline = [datetime]::UtcNow.AddSeconds(60)
+            while (-not [System.IO.File]::Exists($ready) -and -not $holder.HasExited -and [datetime]::UtcNow -lt $deadline) { [System.Threading.Thread]::Sleep(20) }
+            $startedText = [System.IO.File]::GetLastWriteTimeUtc($lockPath).ToString('yyyy-MM-ddTHH:mm:ssZ', [cultureinfo]::InvariantCulture)
             $before = Get-OutputSnapshot -Directory $outputDir
 
             $second = @{ Users = $users; Mailboxes = @{}; Rules = @{}; Traces = @() }
@@ -2695,21 +2745,37 @@ Describe 'Invoke-ForwardingMonitor.ps1 run against stubbed Microsoft calls' {
             $childOutput = & ([System.Environment]::ProcessPath) -NoProfile -NonInteractive -File $monitorScript `
                 -SettingsPath (Join-Path $runRoot 'settings.json') -ApprovedExceptionsPath (Join-Path $runRoot 'exceptions.csv') -SkipConnect 2>&1
             $childExit = $LASTEXITCODE
+
+            # Then the holder is killed. The operating system lets go of its lock, and the next scan takes it at once.
+            $holderWasRunning = -not $holder.HasExited
+            $holder.Kill()
+            $holder.WaitForExit()
+            $holder.Dispose()
+            $third = @{ Users = $users; Mailboxes = @{ 'alex.wilber@contoso.com' = 'smtp:records@partner.example.com' }; Rules = @{}
+                Traces = @((Get-OfflineTrace -SenderAddress 'alex.wilber@contoso.com' -Recipient 'a@vendor.example.com')) }
+            $null = Invoke-OfflineMonitorRun -Name 'busy' -Scenario $third -ExceptionTarget 'nobody@partner.example.com'
         }
 
         It 'stops before it asks Microsoft for anything, with a message that names the folder and when the other scan started' {
+            $holderWasRunning | Should -BeTrue
             $thrown | Should -Not -BeNullOrEmpty
             $thrown.Exception.Message.StartsWith("Another scan is running in $outputDir (started $startedText)") | Should -BeTrue
             [int]$second.GraphCalls | Should -Be 0
         }
 
-        It 'leaves the other scan''s lock and every output file as they were' {
+        It 'leaves every output file as it was' {
             $after | Should -BeExactly $before
         }
 
         It 'exits with code 1 when run as its own process' {
             $childExit | Should -Be 1
             ($childOutput | Out-String) | Should -BeLike '*Another scan is running in*'
+        }
+
+        It 'takes the lock over at once when the process that held it is killed' {
+            $third.ExitCode | Should -Be 0
+            Get-Content -LiteralPath (Join-Path $outputDir 'errors.log') -Raw | Should -BeLike '*Took over the scan lock*no longer running*'
+            Test-ScanLockHeld -Directory $outputDir | Should -BeFalse
         }
     }
 
@@ -2856,12 +2922,14 @@ Describe 'Invoke-ForwardingMonitor.ps1 run against stubbed Microsoft calls' {
             $outputDir = Invoke-OfflineMonitorRun -Name 'killed-scan' -Scenario $scenario -ExceptionTarget 'nobody@partner.example.com'
             $runRoot = Join-Path $TestDrive 'killed-scan'
             $lockPath = Join-Path $outputDir '.scan.lock'
+            $marker = Join-Path $TestDrive 'killed-scan-trace-reached'
 
-            # The reviewer's kill: the real script in its own process, stopped while it waits on the message trace.
-            # A kill (or SIGTERM) skips the script's finally block, so the lock stays behind.
+            # The reviewer's kill: the real script in its own process, killed while it waits on the message trace.
+            # A kill (or SIGTERM) skips the script's finally block; the operating system lets go of the lock anyway.
             $childScript = Join-Path $TestDrive 'scan-until-killed.ps1'
             Set-Content -LiteralPath $childScript -Encoding UTF8 -Value @'
-param([string]$MonitorScript, [string]$RunRoot)
+param([string]$MonitorScript, [string]$RunRoot, [string]$Marker)
+$global:TraceMarker = $Marker
 function global:Invoke-MgGraphRequest {
     [CmdletBinding()]
     param($Method, $Uri)
@@ -2876,106 +2944,58 @@ function global:Get-Mailbox {
 function global:Get-MessageTraceV2 {
     [CmdletBinding()]
     param($StartDate, $EndDate, $ResultSize)
+    [System.IO.File]::WriteAllText($global:TraceMarker, 'reached')
     [System.Threading.Thread]::Sleep(120000)
 }
 & $MonitorScript -SettingsPath (Join-Path $RunRoot 'settings.json') -ApprovedExceptionsPath (Join-Path $RunRoot 'exceptions.csv') -SkipConnect
 '@
             $startInfo = [System.Diagnostics.ProcessStartInfo]::new([System.Environment]::ProcessPath)
-            foreach ($argument in '-NoProfile', '-NonInteractive', '-File', $childScript, $monitorScript, $runRoot) { $startInfo.ArgumentList.Add($argument) }
+            foreach ($argument in '-NoProfile', '-NonInteractive', '-File', $childScript, $monitorScript, $runRoot, $marker) { $startInfo.ArgumentList.Add($argument) }
             $startInfo.UseShellExecute = $false
             $startInfo.RedirectStandardOutput = $true
             $startInfo.RedirectStandardError = $true
             $child = [System.Diagnostics.Process]::Start($startInfo)
-            $lockText = ''
             $deadline = [datetime]::UtcNow.AddSeconds(60)
-            while ($lockText -notlike '*StartedAt:*' -and -not $child.HasExited -and [datetime]::UtcNow -lt $deadline) {
-                [System.Threading.Thread]::Sleep(20)
-                try { $lockText = [System.IO.File]::ReadAllText($lockPath) } catch { $lockText = '' }
-            }
-            # Give it a moment past the lock, so it is waiting on the trace when it is killed.
-            [System.Threading.Thread]::Sleep(500)
+            while (-not [System.IO.File]::Exists($marker) -and -not $child.HasExited -and [datetime]::UtcNow -lt $deadline) { [System.Threading.Thread]::Sleep(20) }
             $childExitedEarly = $child.HasExited
+            $heldWhileRunning = Test-ScanLockHeld -Directory $outputDir
             if (-not $childExitedEarly) { $child.Kill() }
             $child.WaitForExit()
             $child.Dispose()
-            $lockLeft = [System.IO.File]::Exists($lockPath)
+            $heldAfterKill = Test-ScanLockHeld -Directory $outputDir
+            $lockText = [System.IO.File]::ReadAllText($lockPath)
 
             $null = Invoke-OfflineMonitorRun -Name 'killed-scan' -Scenario $scenario -ExceptionTarget 'nobody@partner.example.com'
         }
 
-        It 'was killed while it held the lock, and left the lock behind with this computer''s name' {
+        It 'held the lock while it ran, and the operating system let go of it when the process was killed' {
             $childExitedEarly | Should -BeFalse
-            $lockLeft | Should -BeTrue
-            $lockText | Should -BeLike "*MachineName: $([System.Environment]::MachineName)*"
-            $lockText | Should -BeLike '*ProcessStartedAt:*'
+            $heldWhileRunning | Should -BeTrue
+            $heldAfterKill | Should -BeFalse
+            $lockText | Should -BeLike "*ProcessId: *MachineName: $([System.Environment]::MachineName)*StartedAt: *"
         }
 
-        It 'lets the next scan take the lock over at once, because that process is gone' {
+        It 'lets the next scan take the lock over at once' {
             $scenario.ExitCode | Should -Be 0
-            Get-Content -LiteralPath (Join-Path $outputDir 'errors.log') -Raw | Should -BeLike '*Took over the scan lock*is no longer running*'
-            Join-Path $outputDir '.scan.lock' | Should -Not -Exist
+            Get-Content -LiteralPath (Join-Path $outputDir 'errors.log') -Raw | Should -BeLike '*Took over the scan lock*no longer running*'
+            Test-ScanLockHeld -Directory $outputDir | Should -BeFalse
         }
     }
 
-    Context 'when a scan on this computer that started more than six hours ago is still running' {
-        BeforeAll {
-            $scenario = @{ Users = @((Get-OfflineUser -Name 'alex.wilber' -DisplayName 'Alex Wilber')); Mailboxes = @{}; Rules = @{}
-                Traces = @((Get-OfflineTrace -SenderAddress 'alex.wilber@contoso.com' -Recipient 'a@vendor.example.com')) }
-            $outputDir = Invoke-OfflineMonitorRun -Name 'long-scan' -Scenario $scenario -ExceptionTarget 'nobody@partner.example.com'
-
-            # The reviewer's lock demonstration: a live holder whose lock says it started seven hours ago.
-            $sleeper = [System.Diagnostics.Process]::Start([System.Environment]::ProcessPath, [string[]]@('-NoProfile', '-NonInteractive', '-Command', 'Start-Sleep -Seconds 120'))
-            $sleeperStarted = $sleeper.StartTime.ToUniversalTime().ToString('o', [cultureinfo]::InvariantCulture)
-            $lockStarted = [datetime]::UtcNow.AddHours(-7).ToString('o', [cultureinfo]::InvariantCulture)
-            [System.IO.File]::WriteAllText((Join-Path $outputDir '.scan.lock'),
-                "ProcessId: $($sleeper.Id)`nProcessStartedAt: $sleeperStarted`nMachineName: $([System.Environment]::MachineName)`nStartedAt: $lockStarted`n")
-            $before = Get-OutputSnapshot -Directory $outputDir
-
-            $thrown = $null
-            try { $null = Invoke-OfflineMonitorRun -Name 'long-scan' -Scenario $scenario -ExceptionTarget 'nobody@partner.example.com' }
-            catch { $thrown = $_ }
-            $after = Get-OutputSnapshot -Directory $outputDir
-            $logWhileRunning = Get-Content -LiteralPath (Join-Path $outputDir 'errors.log') -Raw
-
-            # The same lock once that process has ended.
-            $sleeper.Kill()
-            $sleeper.WaitForExit()
-            $sleeper.Dispose()
-            $null = Invoke-OfflineMonitorRun -Name 'long-scan' -Scenario $scenario -ExceptionTarget 'nobody@partner.example.com'
-        }
-
-        It 'respects the lock although it is seven hours old, and logs that a long scan is still running' {
-            $thrown | Should -Not -BeNullOrEmpty
-            $thrown.Exception.Message | Should -BeLike 'Another scan is running in*'
-            $after | Should -BeExactly $before
-            $logWhileRunning | Should -BeLike '*is still running after more than six hours*'
-        }
-
-        It 'takes the same lock over at once when that process has ended' {
-            $scenario.ExitCode | Should -Be 0
-            Get-Content -LiteralPath (Join-Path $outputDir 'errors.log') -Raw | Should -BeLike '*Took over the scan lock*is no longer running*'
-            Join-Path $outputDir '.scan.lock' | Should -Not -Exist
-        }
-    }
-
-    Context 'when the lock names a running process on this computer whose start time <Case>, and the lock is <Age> old' -ForEach @(
-        @{ Case = 'does not match'; Age = 'ten minutes'; Minutes = 10; Recorded = $true; TakenOver = $false; Folder = 'other-start-fresh' }
-        @{ Case = 'does not match'; Age = 'seven hours'; Minutes = 420; Recorded = $true; TakenOver = $true; Folder = 'other-start-old' }
-        @{ Case = 'is not in the lock'; Age = 'ten minutes'; Minutes = 10; Recorded = $false; TakenOver = $false; Folder = 'no-start-fresh' }
-        @{ Case = 'is not in the lock'; Age = 'seven hours'; Minutes = 420; Recorded = $false; TakenOver = $true; Folder = 'no-start-old' }
+    Context 'when the lock file cannot be opened, and it was last written <Age> ago' -ForEach @(
+        @{ Age = 'ten minutes'; Minutes = 10; TakenOver = $false; Folder = 'lock-read-only-fresh' }
+        @{ Age = 'seven hours'; Minutes = 420; TakenOver = $true; Folder = 'lock-read-only-old' }
     ) {
         BeforeAll {
-            # The reviewer's r3: process 1 is always running on macOS and its start time cannot be read, and in a
-            # container the scan is process 1 every run. A process that is running but cannot be shown to be the scan
-            # that wrote the lock falls back to the six-hour rule. The test process stands in for that process.
+            # A lock that cannot be opened for another reason than a scan holding it (here it is read-only) says nothing
+            # about whether a scan runs, so the six-hour rule decides.
             $scenario = @{ Users = @((Get-OfflineUser -Name 'alex.wilber' -DisplayName 'Alex Wilber')); Mailboxes = @{}; Rules = @{}
                 Traces = @((Get-OfflineTrace -SenderAddress 'alex.wilber@contoso.com' -Recipient 'a@vendor.example.com')) }
             $outputDir = Invoke-OfflineMonitorRun -Name $Folder -Scenario $scenario -ExceptionTarget 'nobody@partner.example.com'
-            $lockLines = @("ProcessId: $PID")
-            if ($Recorded) { $lockLines += "ProcessStartedAt: $([datetime]::UtcNow.AddDays(-3).ToString('o', [cultureinfo]::InvariantCulture))" }
-            $lockLines += "MachineName: $([System.Environment]::MachineName)"
-            $lockLines += "StartedAt: $([datetime]::UtcNow.AddMinutes(-$Minutes).ToString('o', [cultureinfo]::InvariantCulture))"
-            [System.IO.File]::WriteAllText((Join-Path $outputDir '.scan.lock'), ($lockLines -join "`n") + "`n")
+            $lockPath = Join-Path $outputDir '.scan.lock'
+            [System.IO.File]::WriteAllText($lockPath, "ProcessId: 4242`nMachineName: other-host.example.com`nStartedAt: $([datetime]::UtcNow.AddMinutes(-$Minutes).ToString('o', [cultureinfo]::InvariantCulture))`n")
+            [System.IO.File]::SetLastWriteTimeUtc($lockPath, [datetime]::UtcNow.AddMinutes(-$Minutes))
+            Set-ItemProperty -LiteralPath $lockPath -Name IsReadOnly -Value $true
             $before = Get-OutputSnapshot -Directory $outputDir
 
             $thrown = $null
@@ -2984,15 +3004,19 @@ function global:Get-MessageTraceV2 {
             catch { $thrown = $_ }
         }
 
-        It 'takes the lock over only once it is more than six hours old' {
+        AfterAll {
+            if ([System.IO.File]::Exists($lockPath)) { Set-ItemProperty -LiteralPath $lockPath -Name IsReadOnly -Value $false }
+        }
+
+        It 'stops while the lock is less than six hours old, and takes it over after that, saying why' {
             if ($TakenOver) {
                 $thrown | Should -BeNullOrEmpty
                 $scenario.ExitCode | Should -Be 0
-                Get-Content -LiteralPath (Join-Path $outputDir 'errors.log') -Raw | Should -BeLike '*Took over the scan lock*more than six hours*'
-                Join-Path $outputDir '.scan.lock' | Should -Not -Exist
+                Get-Content -LiteralPath (Join-Path $outputDir 'errors.log') -Raw | Should -BeLike '*Took over the scan lock*could not be opened*more than six hours*'
+                Test-ScanLockHeld -Directory $outputDir | Should -BeFalse
             }
             else {
-                $thrown.Exception.Message | Should -BeLike 'Another scan is running in*'
+                $thrown.Exception.Message | Should -BeLike '*scan lock*cannot be opened*less than six hours*'
                 Get-OutputSnapshot -Directory $outputDir | Should -BeExactly $before
             }
         }
@@ -3026,6 +3050,7 @@ function global:Get-MessageTraceV2 {
             $runs[2].ExitCode | Should -Be 2
             @($runs[2].Findings).Count | Should -Be 1
             $runs[2].Findings[0].NotRechecked | Should -BeTrue
+            $runs[2].Findings[0].KeptBecause | Should -BeExactly 'NoMailbox'
             $runs[2].Summary.UsersWithoutMailbox.Count | Should -Be 0
         }
 
@@ -3094,9 +3119,10 @@ function global:Get-MessageTraceV2 {
         BeforeAll {
             # The reviewer's r7: an unencoded # in the Graph URL starts a fragment, so the rules read failed every run.
             $guest = 'jane_fabrikam.com#EXT#@contoso.onmicrosoft.com'
+            $guestId = '00000000-0000-0000-0000-000000000000'
             $scenario = @{
                 Users     = @(
-                    @{ id = '00000000-0000-0000-0000-000000000000'; displayName = 'Jane (Fabrikam)'; userPrincipalName = $guest; mail = 'jane@fabrikam.example.com'; accountEnabled = $true; userType = 'Member' }
+                    @{ id = $guestId; displayName = 'Jane (Fabrikam)'; userPrincipalName = $guest; mail = 'jane@fabrikam.example.com'; accountEnabled = $true; userType = 'Member' }
                     (Get-OfflineUser -Name 'bob.diaz' -DisplayName 'Bob Diaz')
                 )
                 Mailboxes = @{}
@@ -3111,6 +3137,139 @@ function global:Get-MessageTraceV2 {
             @($scenario.RuleCalls | Where-Object { $_ -eq $guest }).Count | Should -Be 1
             $finding = @(Get-Content -LiteralPath (Join-Path $outputDir 'forwarding-findings.json') -Raw | ConvertFrom-Json) | Where-Object UserPrincipalName -eq $guest
             $finding.RiskLevel | Should -BeExactly 'Critical'
+        }
+
+        It 'reads inbox rules by object id, so no user name goes into the URL' {
+            @($scenario.RuleUris) | Should -Contain "https://graph.microsoft.com/v1.0/users/$guestId/mailFolders/inbox/messageRules"
+            @($scenario.RuleUris | Where-Object { $_ -like '*contoso.*' -or $_ -like '*EXT*' }).Count | Should -Be 0
+        }
+    }
+
+    Context 'when a mailbox that could not be read then says it has none' {
+        BeforeAll {
+            # The reviewer's s1: the forwards are kept after the failed read, kept once more after the first "no mailbox"
+            # answer, and dropped only after the second one.
+            $users = @((Get-OfflineUser -Name 'alex.wilber' -DisplayName 'Alex Wilber'), (Get-OfflineUser -Name 'bob.diaz' -DisplayName 'Bob Diaz'))
+            $live = @{ Users = $users; Traces = @(); Mailboxes = @{ 'alex.wilber@contoso.com' = 'smtp:alex.home@webmail.example.com' }
+                Rules = @{ 'alex.wilber@contoso.com' = @((Get-OfflineRule -Name 'Copy home' -Target 'alex.copy@webmail.example.com')) } }
+            $outputDir = Invoke-OfflineMonitorRun -Name 'failed-then-gone' -Scenario $live -ExceptionTarget 'nobody@partner.example.com'
+            $runs = @{}
+            foreach ($run in 2, 3, 4) {
+                $scenario = if ($run -eq 2) {
+                    @{ Users = $users; Traces = @(); Mailboxes = @{}; Rules = @{}; MailboxErrors = @('alex.wilber@contoso.com'); RuleErrors = @('alex.wilber@contoso.com') }
+                }
+                else {
+                    @{ Users = $users; Traces = @(); Mailboxes = @{}; Rules = @{}; NoMailbox = @('alex.wilber@contoso.com'); RulesNoMailbox = @('alex.wilber@contoso.com') }
+                }
+                $null = Invoke-OfflineMonitorRun -Name 'failed-then-gone' -Scenario $scenario -ExceptionTarget 'nobody@partner.example.com'
+                $runs[$run] = @{
+                    ExitCode = $scenario.ExitCode
+                    Findings = @(Get-Content -LiteralPath (Join-Path $outputDir 'forwarding-findings.json') -Raw | ConvertFrom-Json)
+                    Summary  = Get-Content -LiteralPath (Join-Path $outputDir 'summary.json') -Raw | ConvertFrom-Json
+                    Dropped  = @(Get-Content -LiteralPath (Join-Path $outputDir 'errors.log') | Where-Object { $_ -like '*Dropped the earlier forwards for alex.wilber@contoso.com*' })
+                }
+            }
+        }
+
+        It 'run 2 keeps both forwards, marked as kept because the reads failed' {
+            $runs[2].ExitCode | Should -Be 2
+            @($runs[2].Findings).Count | Should -Be 2
+            @($runs[2].Findings | Where-Object { $_.NotRechecked -eq $true -and $_.KeptBecause -eq 'Failed' }).Count | Should -Be 2
+        }
+
+        It 'run 3 keeps them once more, now because of no mailbox, and drops nothing' {
+            $runs[3].ExitCode | Should -Be 2
+            @($runs[3].Findings | Where-Object { $_.NotRechecked -eq $true -and $_.KeptBecause -eq 'NoMailbox' }).Count | Should -Be 2
+            $runs[3].Summary.UsersWithoutMailbox.Count | Should -Be 0
+            $runs[3].Dropped.Count | Should -Be 0
+        }
+
+        It 'run 4 drops them, lists the account as having no mailbox, and says so in words that match what happened' {
+            $runs[4].ExitCode | Should -Be 0
+            @($runs[4].Findings).Count | Should -Be 0
+            @($runs[4].Summary.UsersWithoutMailbox.UserPrincipalNames) | Should -Be @('alex.wilber@contoso.com')
+            $runs[4].Dropped.Count | Should -Be 2
+            $runs[4].Dropped | Should -BeLike '*Dropped the earlier forwards for alex.wilber@contoso.com*has reported no mailbox for two runs*'
+        }
+    }
+
+    Context 'when Exchange says no mailbox again while the Graph read fails' {
+        BeforeAll {
+            # The reviewer's s2 scenario B: only the forward whose collector said "no mailbox" twice may go. The inbox
+            # rule forward was not read this time, so it is kept.
+            $users = @((Get-OfflineUser -Name 'alex.wilber' -DisplayName 'Alex Wilber'), (Get-OfflineUser -Name 'bob.diaz' -DisplayName 'Bob Diaz'))
+            $live = @{ Users = $users; Traces = @(); Mailboxes = @{ 'alex.wilber@contoso.com' = 'smtp:alex.home@webmail.example.com' }
+                Rules = @{ 'alex.wilber@contoso.com' = @((Get-OfflineRule -Name 'Copy home' -Target 'alex.copy@webmail.example.com')) } }
+            $outputDir = Invoke-OfflineMonitorRun -Name 'exchange-gone-graph-failed' -Scenario $live -ExceptionTarget 'nobody@partner.example.com'
+            $gone = @{ Users = $users; Traces = @(); Mailboxes = @{}; Rules = @{}; NoMailbox = @('alex.wilber@contoso.com'); RulesNoMailbox = @('alex.wilber@contoso.com') }
+            $null = Invoke-OfflineMonitorRun -Name 'exchange-gone-graph-failed' -Scenario $gone -ExceptionTarget 'nobody@partner.example.com'
+            $mixed = @{ Users = $users; Traces = @(); Mailboxes = @{}; Rules = @{}; NoMailbox = @('alex.wilber@contoso.com'); RuleErrors = @('alex.wilber@contoso.com') }
+            $null = Invoke-OfflineMonitorRun -Name 'exchange-gone-graph-failed' -Scenario $mixed -ExceptionTarget 'nobody@partner.example.com'
+            $findingsThree = @(Get-Content -LiteralPath (Join-Path $outputDir 'forwarding-findings.json') -Raw | ConvertFrom-Json)
+            $droppedThree = @(Get-Content -LiteralPath (Join-Path $outputDir 'errors.log') | Where-Object { $_ -like '*Dropped the earlier forwards*' })
+            $back = @{ Users = $users; Traces = @(); Mailboxes = $live.Mailboxes; Rules = $live.Rules }
+            $null = Invoke-OfflineMonitorRun -Name 'exchange-gone-graph-failed' -Scenario $back -ExceptionTarget 'nobody@partner.example.com'
+            $findingsFour = @(Get-Content -LiteralPath (Join-Path $outputDir 'forwarding-findings.json') -Raw | ConvertFrom-Json)
+        }
+
+        It 'drops only the mailbox forward, which Exchange has now said twice has no mailbox, and keeps the inbox rule forward' {
+            $mixed.ExitCode | Should -Be 2
+            @($findingsThree | Where-Object ForwardingType -eq 'MailboxForwarding').Count | Should -Be 0
+            $rule = @($findingsThree | Where-Object ForwardingType -eq 'InboxRuleForward')
+            $rule.Count | Should -Be 1
+            $rule[0].NotRechecked | Should -BeTrue
+            $rule[0].KeptBecause | Should -BeExactly 'Failed'
+            $droppedThree.Count | Should -Be 1
+            $droppedThree[0] | Should -BeLike '*(mailbox forwarding): Get-Mailbox has reported no mailbox for two runs*'
+        }
+
+        It 'reports both forwards as read again once the mailbox is back' {
+            $back.ExitCode | Should -Be 0
+            @($findingsFour | Where-Object { $_.NotRechecked -eq $false -and $_.KeptBecause -eq '' }).Count | Should -Be 2
+        }
+    }
+
+    Context 'when the previous report holds <Case>' -ForEach @(
+        @{ Case = 'null'; Content = 'null'; Folder = 'report-null' }
+        @{ Case = 'a number'; Content = '42'; Folder = 'report-number' }
+        @{ Case = 'an object that is not a finding'; Content = '{"value":[{"UserPrincipalName":"alex.wilber@contoso.com"}]}'; Folder = 'report-object' }
+    ) {
+        BeforeAll {
+            # The reviewer's s3 scenario G: valid JSON that is not a report must not read as "no findings".
+            $users = @((Get-OfflineUser -Name 'alex.wilber' -DisplayName 'Alex Wilber'), (Get-OfflineUser -Name 'bob.diaz' -DisplayName 'Bob Diaz'))
+            $first = @{ Users = $users; Traces = @(); Rules = @{}; Mailboxes = @{ 'alex.wilber@contoso.com' = 'smtp:alex.home@webmail.example.com' } }
+            $outputDir = Invoke-OfflineMonitorRun -Name $Folder -Scenario $first -ExceptionTarget 'nobody@partner.example.com'
+            [System.IO.File]::WriteAllText((Join-Path $outputDir 'forwarding-findings.json'), $Content)
+            $gone = @{ Users = $users; Traces = @(); Rules = @{}; Mailboxes = @{}; NoMailbox = @('alex.wilber@contoso.com'); RulesNoMailbox = @('alex.wilber@contoso.com') }
+            $null = Invoke-OfflineMonitorRun -Name $Folder -Scenario $gone -ExceptionTarget 'nobody@partner.example.com'
+            $summary = Get-Content -LiteralPath (Join-Path $outputDir 'summary.json') -Raw | ConvertFrom-Json
+        }
+
+        It 'treats it as unreadable: PreviousReportUnreadable, the account counted as a failed read, and exit 2' {
+            $gone.ExitCode | Should -Be 2
+            $summary.PreviousReportUnreadable | Should -BeTrue
+            @($summary.CollectionFailures.MailboxForwarding.UserPrincipalNames) | Should -Be @('alex.wilber@contoso.com')
+            $summary.UsersWithoutMailbox.Count | Should -Be 0
+        }
+    }
+
+    Context 'when the previous report is missing although summary.json shows a run completed' {
+        BeforeAll {
+            # The reviewer's s4.
+            $users = @((Get-OfflineUser -Name 'alex.wilber' -DisplayName 'Alex Wilber'), (Get-OfflineUser -Name 'bob.diaz' -DisplayName 'Bob Diaz'))
+            $first = @{ Users = $users; Traces = @(); Rules = @{}; Mailboxes = @{ 'alex.wilber@contoso.com' = 'smtp:alex.home@webmail.example.com' } }
+            $outputDir = Invoke-OfflineMonitorRun -Name 'report-missing' -Scenario $first -ExceptionTarget 'nobody@partner.example.com'
+            Remove-Item -LiteralPath (Join-Path $outputDir 'forwarding-findings.json')
+            $gone = @{ Users = $users; Traces = @(); Rules = @{}; Mailboxes = @{}; NoMailbox = @('alex.wilber@contoso.com'); RulesNoMailbox = @('alex.wilber@contoso.com') }
+            $null = Invoke-OfflineMonitorRun -Name 'report-missing' -Scenario $gone -ExceptionTarget 'nobody@partner.example.com'
+            $summary = Get-Content -LiteralPath (Join-Path $outputDir 'summary.json') -Raw | ConvertFrom-Json
+        }
+
+        It 'treats it as unreadable rather than as a first run, and exits 2' {
+            $gone.ExitCode | Should -Be 2
+            $summary.PreviousReportUnreadable | Should -BeTrue
+            @($summary.CollectionFailures.MailboxForwarding.UserPrincipalNames) | Should -Be @('alex.wilber@contoso.com')
+            Get-Content -LiteralPath (Join-Path $outputDir 'errors.log') -Raw | Should -BeLike '*forwarding-findings.json is missing*summary.json*'
         }
     }
 
@@ -3157,17 +3316,147 @@ function global:Get-MessageTraceV2 {
             $after = Get-OutputSnapshot -Directory $outputDir
         }
 
-        It 'exits 1, so a scheduler does not take it for a clean run' {
+        It 'was stopped while it waited on the message trace' {
             $signal.Waiting | Should -BeTrue
             $stoppedExitCode | Should -Be 1
         }
 
         It 'says so in errors.log' {
-            Get-Content -LiteralPath (Join-Path $outputDir 'errors.log') -Raw | Should -BeLike '*Scan did not complete*'
+            Get-Content -LiteralPath (Join-Path $outputDir 'errors.log') -Raw | Should -BeLike "*Scan did not complete*previous run's files*"
         }
 
-        It 'releases the lock and leaves the previous run''s files as they were' {
+        It 'lets go of the lock and leaves the previous run''s files as they were' {
             $after | Should -BeExactly $before
+            Test-ScanLockHeld -Directory $outputDir | Should -BeFalse
+        }
+    }
+
+    Context 'when a scan is stopped after its files were put in place' {
+        BeforeAll {
+            $scenario = @{ Users = @((Get-OfflineUser -Name 'alex.wilber' -DisplayName 'Alex Wilber')); Mailboxes = @{}; Rules = @{}
+                Traces = @((Get-OfflineTrace -SenderAddress 'alex.wilber@contoso.com' -Recipient 'a@vendor.example.com')) }
+            $outputDir = Invoke-OfflineMonitorRun -Name 'stopped-late' -Scenario $scenario -ExceptionTarget 'nobody@partner.example.com'
+            $summaryBefore = [System.IO.File]::ReadAllText((Join-Path $outputDir 'summary.json'))
+            $runRoot = Join-Path $TestDrive 'stopped-late'
+
+            # The stop lands on the console output that follows the put-in-place step.
+            $signal = [hashtable]::Synchronized(@{ Waiting = $false })
+            $runner = [powershell]::Create()
+            $null = $runner.AddScript({
+                    param($MonitorScript, $RunRoot, $Signal)
+                    $global:StopSignal = $Signal
+                    function global:Invoke-MgGraphRequest {
+                        [CmdletBinding()]
+                        param($Method, $Uri)
+                        if ($Uri -match '/messageRules$') { return @{ value = @() } }
+                        return @{ value = @(@{ id = '00000000-0000-0000-0000-000000000000'; displayName = 'Alex Wilber'; userPrincipalName = 'alex.wilber@contoso.com'; mail = 'alex.wilber@contoso.com'; accountEnabled = $true; userType = 'Member' }) }
+                    }
+                    function global:Get-Mailbox {
+                        [CmdletBinding()]
+                        param($Identity)
+                        return [pscustomobject]@{ DisplayName = 'Alex Wilber'; UserPrincipalName = $Identity; PrimarySmtpAddress = $Identity; ForwardingAddress = $null; ForwardingSmtpAddress = $null; DeliverToMailboxAndForward = $false }
+                    }
+                    function global:Get-MessageTraceV2 {
+                        [CmdletBinding()]
+                        param($StartDate, $EndDate, $ResultSize)
+                        return @()
+                    }
+                    function global:Write-Host {
+                        [CmdletBinding()]
+                        param([Parameter(Position = 0)][object]$Object, [switch]$NoNewline, [object]$ForegroundColor)
+                        if ("$Object" -like 'M365 Forwarding Monitor complete*') {
+                            $global:StopSignal.Waiting = $true
+                            Microsoft.PowerShell.Utility\Start-Sleep -Seconds 60
+                        }
+                    }
+                    & $MonitorScript -SettingsPath (Join-Path $RunRoot 'settings.json') -ApprovedExceptionsPath (Join-Path $RunRoot 'exceptions.csv') -SkipConnect 3>$null
+                }).AddArgument($monitorScript).AddArgument($runRoot).AddArgument($signal)
+            $handle = $runner.BeginInvoke()
+            $deadline = [datetime]::UtcNow.AddSeconds(60)
+            while (-not $signal.Waiting -and -not $handle.IsCompleted -and [datetime]::UtcNow -lt $deadline) { [System.Threading.Thread]::Sleep(20) }
+            $runner.Stop()
+            $runner.Dispose()
+        }
+
+        It 'says in errors.log that this run''s files were put in place' {
+            $signal.Waiting | Should -BeTrue
+            $log = Get-Content -LiteralPath (Join-Path $outputDir 'errors.log') -Raw
+            $log | Should -BeLike "*Scan did not complete*this run's files were put in place*"
+            $log | Should -Not -BeLike "*previous run's files were left*"
+        }
+
+        It 'leaves this run''s files in place and lets go of the lock' {
+            [System.IO.File]::ReadAllText((Join-Path $outputDir 'summary.json')) | Should -Not -BeExactly $summaryBefore
+            Test-ScanLockHeld -Directory $outputDir | Should -BeFalse
+        }
+    }
+
+    Context 'when a scan that runs as its own process gets Ctrl+C' {
+        It 'exits 1, the exit code a scheduler sees, and leaves the previous run''s files as they were' {
+            if ($IsWindows) {
+                Set-ItResult -Skipped -Because 'Windows has no portable way to send Ctrl+C to another process'
+                return
+            }
+
+            $scenario = @{ Users = @((Get-OfflineUser -Name 'alex.wilber' -DisplayName 'Alex Wilber')); Mailboxes = @{}; Rules = @{}
+                Traces = @((Get-OfflineTrace -SenderAddress 'alex.wilber@contoso.com' -Recipient 'a@vendor.example.com')) }
+            $outputDir = Invoke-OfflineMonitorRun -Name 'sigint' -Scenario $scenario -ExceptionTarget 'nobody@partner.example.com'
+            $before = Get-OutputSnapshot -Directory $outputDir
+            $runRoot = Join-Path $TestDrive 'sigint'
+            $marker = Join-Path $TestDrive 'sigint-trace-reached'
+
+            # The stubs are defined in a wrapper that then calls the script, the way the container entrypoint does. A
+            # stub module on PSModulePath would be found only after the Graph module in the shared module folder.
+            $wrapper = Join-Path $TestDrive 'scan-until-sigint.ps1'
+            Set-Content -LiteralPath $wrapper -Encoding UTF8 -Value @'
+param([string]$MonitorScript, [string]$RunRoot, [string]$Marker)
+$global:TraceMarker = $Marker
+function global:Invoke-MgGraphRequest {
+    [CmdletBinding()]
+    param($Method, $Uri)
+    if ($Uri -match '/messageRules$') { return @{ value = @() } }
+    return @{ value = @(@{ id = '00000000-0000-0000-0000-000000000000'; displayName = 'Alex Wilber'; userPrincipalName = 'alex.wilber@contoso.com'; mail = 'alex.wilber@contoso.com'; accountEnabled = $true; userType = 'Member' }) }
+}
+function global:Get-Mailbox {
+    [CmdletBinding()]
+    param($Identity)
+    return [pscustomobject]@{ DisplayName = 'Alex Wilber'; UserPrincipalName = $Identity; PrimarySmtpAddress = $Identity; ForwardingAddress = $null; ForwardingSmtpAddress = $null; DeliverToMailboxAndForward = $false }
+}
+function global:Get-MessageTraceV2 {
+    [CmdletBinding()]
+    param($StartDate, $EndDate, $ResultSize)
+    [System.IO.File]::WriteAllText($global:TraceMarker, 'reached')
+    Microsoft.PowerShell.Utility\Start-Sleep -Seconds 60
+}
+& $MonitorScript -SettingsPath (Join-Path $RunRoot 'settings.json') -ApprovedExceptionsPath (Join-Path $RunRoot 'exceptions.csv') -SkipConnect
+'@
+            $pwshArguments = @('-NoProfile', '-NonInteractive', '-File', $wrapper, $monitorScript, $runRoot, $marker)
+            # perl puts SIGINT back to its default first, in case the test runner was started with SIGINT ignored.
+            if ([System.IO.File]::Exists('/usr/bin/perl')) {
+                $startInfo = [System.Diagnostics.ProcessStartInfo]::new('/usr/bin/perl')
+                foreach ($argument in @('-e', '$SIG{INT} = "DEFAULT"; exec @ARGV', [System.Environment]::ProcessPath) + $pwshArguments) { $startInfo.ArgumentList.Add($argument) }
+            }
+            else {
+                $startInfo = [System.Diagnostics.ProcessStartInfo]::new([System.Environment]::ProcessPath)
+                foreach ($argument in $pwshArguments) { $startInfo.ArgumentList.Add($argument) }
+            }
+            $startInfo.UseShellExecute = $false
+            $startInfo.RedirectStandardOutput = $true
+            $startInfo.RedirectStandardError = $true
+            $child = [System.Diagnostics.Process]::Start($startInfo)
+            $deadline = [datetime]::UtcNow.AddSeconds(60)
+            while (-not [System.IO.File]::Exists($marker) -and -not $child.HasExited -and [datetime]::UtcNow -lt $deadline) { [System.Threading.Thread]::Sleep(20) }
+            [System.Threading.Thread]::Sleep(300)
+            & /bin/kill -INT $child.Id
+            $exited = $child.WaitForExit(60000)
+            $exitCode = if ($exited) { $child.ExitCode } else { $child.Kill(); 'still running' }
+            $child.Dispose()
+
+            [System.IO.File]::Exists($marker) | Should -BeTrue
+            $exitCode | Should -Be 1
+            Get-Content -LiteralPath (Join-Path $outputDir 'errors.log') -Raw | Should -BeLike "*Scan did not complete*previous run's files*"
+            Get-OutputSnapshot -Directory $outputDir | Should -BeExactly $before
+            Test-ScanLockHeld -Directory $outputDir | Should -BeFalse
         }
     }
 
@@ -3335,8 +3624,31 @@ Describe 'Putting the staged output files in place' {
         Get-FolderState -Folder $folder | Should -BeExactly $before
     }
 
+    It 'tries a move that fails with access denied three times on Windows, where an indexer or OneDrive holds files that way, and once elsewhere' {
+        Mock Start-Sleep {}
+        $calls = @{ Count = 0 }
+        Mock Move-M365File { $calls.Count++; throw [System.UnauthorizedAccessException]::new('Access to the path is denied.') } -ParameterFilter { $Source -like '*.summary.json.*.tmp' }
+        $folder = New-TestFolder -Name 'access-denied'
+        $before = Get-FolderState -Folder $folder
+        $staged = New-TestStagedSet -Folder $folder
+
+        { Publish-M365StagedFile -Staged $staged } | Should -Throw "*summary.json in place*The previous run's files were put back*"
+        $calls.Count | Should -Be $(if ($IsWindows) { 3 } else { 1 })
+        Get-FolderState -Folder $folder | Should -BeExactly $before
+    }
+
+    It 'goes by the error code, not the message: an error that only says busy is not tried again' {
+        Mock Start-Sleep {}
+        $calls = @{ Count = 0 }
+        Mock Move-M365File { $calls.Count++; throw [System.IO.IOException]::new('Could not write to /srv/busy-reports/summary.json.') } -ParameterFilter { $Source -like '*.summary.json.*.tmp' }
+        $folder = New-TestFolder -Name 'busy-in-message'
+        $staged = New-TestStagedSet -Folder $folder
+
+        { Publish-M365StagedFile -Staged $staged } | Should -Throw '*summary.json in place*'
+        $calls.Count | Should -Be 1
+    }
+
     It 'does not try again a move that fails with <Kind>, which waiting does not fix' -ForEach @(
-        @{ Kind = 'System.UnauthorizedAccessException' }
         @{ Kind = 'System.IO.IOException' }
         @{ Kind = 'System.IO.PathTooLongException' }
         @{ Kind = 'System.IO.DirectoryNotFoundException' }
@@ -3565,7 +3877,7 @@ Describe 'Putting the staged output files in place' {
 Describe 'Releasing the scan lock' {
     BeforeAll {
         $monitorScript = Join-Path (Join-Path $PSScriptRoot '..') 'src/Invoke-ForwardingMonitor.ps1'
-        foreach ($functionName in 'Remove-M365File', 'Read-M365ScanLock', 'Get-M365ScanLockHolderState', 'Enter-M365ScanLock', 'Exit-M365ScanLock') {
+        foreach ($functionName in 'Remove-M365File', 'Test-M365LockConflict', 'ConvertFrom-M365ScanLockText', 'Enter-M365ScanLock', 'Exit-M365ScanLock') {
             . ([scriptblock]::Create((Get-FunctionTextFromFile -Path $monitorScript -Name $functionName)))
         }
 
@@ -3576,36 +3888,56 @@ Describe 'Releasing the scan lock' {
         }
     }
 
-    It 'writes the process id, the process start time, the computer name and the start time into the lock' {
+    It 'holds the lock for the run, writes the process id, the computer name and the start time into it, and empties it on the way out' {
         $folder = New-LockFolder
         $lock = Enter-M365ScanLock -OutputPath $folder -StartedUtc ([datetime]::UtcNow)
+        $heldWhileRunning = $false
         try {
-            $text = [System.IO.File]::ReadAllText((Join-Path $folder '.scan.lock'))
+            ([System.IO.FileStream]::new((Join-Path $folder '.scan.lock'), [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::None)).Dispose()
         }
-        finally {
-            Exit-M365ScanLock -Lock $lock
+        catch {
+            $heldWhileRunning = $true
         }
+        Exit-M365ScanLock -Lock $lock
 
-        $text | Should -BeLike "*ProcessId: $PID*"
-        $text | Should -BeLike '*ProcessStartedAt: 2*'
-        $text | Should -BeLike "*MachineName: $([System.Environment]::MachineName)*"
-        $text | Should -BeLike '*StartedAt: 2*'
-        Join-Path $folder '.scan.lock' | Should -Not -Exist
+        $heldWhileRunning | Should -BeTrue
+        $lock.Text | Should -BeLike "*ProcessId: $PID*"
+        $lock.Text | Should -BeLike "*MachineName: $([System.Environment]::MachineName)*"
+        $lock.Text | Should -BeLike '*StartedAt: 2*'
+        [System.IO.File]::ReadAllText((Join-Path $folder '.scan.lock')) | Should -BeExactly ''
+        Join-Path $folder 'errors.log' | Should -Not -Exist
     }
 
-    It 'takes over at once a lock from this computer whose process is no longer running' {
+    It 'refuses while another handle holds the lock' {
         $folder = New-LockFolder
-        $ended = [System.Diagnostics.Process]::Start([System.Environment]::ProcessPath, [string[]]@('-NoProfile', '-NonInteractive', '-Command', 'exit 0'))
-        $endedId = $ended.Id
-        $ended.WaitForExit()
-        $ended.Dispose()
+        $other = [System.IO.FileStream]::new((Join-Path $folder '.scan.lock'), [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+        try {
+            { Enter-M365ScanLock -OutputPath $folder -StartedUtc ([datetime]::UtcNow) } | Should -Throw "Another scan is running in $folder (started *"
+        }
+        finally {
+            $other.Dispose()
+        }
+    }
+
+    It 'takes over at once a lock file no process holds, and logs what the file said' {
+        $folder = New-LockFolder
         $fiveMinutesAgo = [datetime]::UtcNow.AddMinutes(-5).ToString('o', [cultureinfo]::InvariantCulture)
-        [System.IO.File]::WriteAllText((Join-Path $folder '.scan.lock'), "ProcessId: $endedId`nMachineName: $([System.Environment]::MachineName)`nStartedAt: $fiveMinutesAgo`n")
+        [System.IO.File]::WriteAllText((Join-Path $folder '.scan.lock'), "ProcessId: 4242`nMachineName: other-host.example.com`nStartedAt: $fiveMinutesAgo`n")
 
         $lock = Enter-M365ScanLock -OutputPath $folder -StartedUtc ([datetime]::UtcNow)
         Exit-M365ScanLock -Lock $lock
 
-        Get-Content -LiteralPath (Join-Path $folder 'errors.log') -Raw | Should -BeLike "*Took over the scan lock*process $endedId on this computer is no longer running*"
+        Get-Content -LiteralPath (Join-Path $folder 'errors.log') -Raw | Should -BeLike '*Took over the scan lock*process 4242 on other-host.example.com*no longer running*'
+    }
+
+    It 'says so in errors.log when it cannot empty the lock on the way out' {
+        $folder = New-LockFolder
+        $lock = Enter-M365ScanLock -OutputPath $folder -StartedUtc ([datetime]::UtcNow)
+        $lock.Stream.Dispose()
+
+        Exit-M365ScanLock -Lock $lock 3>$null
+
+        Get-Content -LiteralPath (Join-Path $folder 'errors.log') -Raw | Should -BeLike '*Could not empty the scan lock*'
     }
 }
 
