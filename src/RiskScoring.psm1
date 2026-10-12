@@ -23,7 +23,7 @@ function Write-M365MonitorError {
 
         $timestamp = (Get-Date).ToString("o")
         $detail = if ($ErrorRecord) { $ErrorRecord.ToString() } else { "" }
-        Add-Content -Path (Join-Path $OutputPath "errors.log") -Value "[$timestamp] $Message $detail"
+        Add-Content -LiteralPath (Join-Path $OutputPath "errors.log") -Value "[$timestamp] $Message $detail"
     }
     catch {
         Write-Warning "Unable to write to errors.log: $($_.Exception.Message)"
@@ -46,7 +46,12 @@ function Invoke-M365CallWithRetry {
         [int]$MaxAttempts = 3,
 
         [Parameter()]
-        [switch]$ThrowOnFailure
+        [switch]$ThrowOnFailure,
+
+        # An error whose text (message or error details) matches this pattern is not retried and is not logged
+        # as a failure. The original error is rethrown so the caller can tell it from a call that gave up.
+        [Parameter()]
+        [string]$NoRetryPattern
     )
 
     for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
@@ -54,6 +59,13 @@ function Invoke-M365CallWithRetry {
             return & $ScriptBlock
         }
         catch {
+            if ($NoRetryPattern) {
+                $errorDetails = if ($_.ErrorDetails) { [string]$_.ErrorDetails.Message } else { "" }
+                if ("$($_.Exception.Message) $errorDetails" -match $NoRetryPattern) {
+                    throw $_
+                }
+            }
+
             $statusCode = $null
             $response = $null
             if ($_.Exception.PSObject.Properties.Name -contains "Response") {
@@ -86,6 +98,43 @@ function Invoke-M365CallWithRetry {
     }
 }
 
+function Get-M365TargetAddress {
+    [CmdletBinding()]
+    param(
+        [Parameter()]
+        [string]$Target
+    )
+
+    # Returns the lower-case mail address a forwarding target points at, or $null when the text does not
+    # name exactly one address. A target that is unclear is never approved and is treated as external.
+    if ([string]::IsNullOrWhiteSpace($Target)) {
+        return $null
+    }
+
+    $text = $Target.Trim()
+    if ($text.StartsWith("smtp:", [System.StringComparison]::OrdinalIgnoreCase)) {
+        $text = $text.Substring(5).Trim()
+    }
+
+    # Exactly one at sign. Two or more mean two addresses, a quoted local part that holds an address, or
+    # display text that holds one. Whichever it is, the real destination cannot be told from the text.
+    if (($text.Length - $text.Replace("@", "").Length) -ne 1) {
+        return $null
+    }
+
+    $mailAddress = $null
+    if ([System.Net.Mail.MailAddress]::TryCreate($text, [ref]$mailAddress)) {
+        return $mailAddress.Address.ToLowerInvariant()
+    }
+
+    # The angle-bracket form, only when the whole string did not parse.
+    if ($text -match "<([^<>\s@]+@[^<>\s@]+)>\s*$" -and [System.Net.Mail.MailAddress]::TryCreate($Matches[1], [ref]$mailAddress)) {
+        return $mailAddress.Address.ToLowerInvariant()
+    }
+
+    return $null
+}
+
 function Get-M365TargetDomain {
     [CmdletBinding()]
     param(
@@ -93,28 +142,12 @@ function Get-M365TargetDomain {
         [string]$Target
     )
 
-    if ([string]::IsNullOrWhiteSpace($Target)) {
+    $address = Get-M365TargetAddress -Target $Target
+    if (-not $address) {
         return $null
     }
 
-    $clean = $Target.Trim()
-    if ($clean -match "SMTP:([^>\s]+@[^>\s]+)") {
-        $clean = $Matches[1]
-    }
-    elseif ($clean -match "([^<>\s]+@[^<>\s]+)") {
-        $clean = $Matches[1]
-    }
-
-    $mailAddress = $null
-    if ([System.Net.Mail.MailAddress]::TryCreate($clean, [ref]$mailAddress)) {
-        return $mailAddress.Host.ToLowerInvariant()
-    }
-
-    if ($clean -like "*@*") {
-        return ($clean.Split("@")[-1]).Trim(">").ToLowerInvariant()
-    }
-
-    return $null
+    return $address.Substring($address.LastIndexOf("@") + 1)
 }
 
 function Test-M365InternalDomain {
@@ -131,8 +164,15 @@ function Test-M365InternalDomain {
         return $false
     }
 
-    $normalized = $Domain.ToLowerInvariant()
-    return @($InternalDomains | ForEach-Object { $_.ToLowerInvariant() }) -contains $normalized
+    # Ordinal comparison: the -eq and -contains operators ignore soft hyphens and zero-width characters,
+    # so a domain with one hidden in it would match a listed domain.
+    foreach ($candidate in $InternalDomains) {
+        if ([string]::Equals($candidate, $Domain, [System.StringComparison]::OrdinalIgnoreCase)) {
+            return $true
+        }
+    }
+
+    return $false
 }
 
 function Test-M365PersonalDomain {
@@ -149,44 +189,43 @@ function Test-M365PersonalDomain {
         return $false
     }
 
-    $normalized = $Domain.ToLowerInvariant()
-    return @($PersonalDomains | ForEach-Object { $_.ToLowerInvariant() }) -contains $normalized
+    foreach ($candidate in $PersonalDomains) {
+        if ([string]::Equals($candidate, $Domain, [System.StringComparison]::OrdinalIgnoreCase)) {
+            return $true
+        }
+    }
+
+    return $false
 }
 
-function Get-M365TargetAddress {
+function Get-M365ExceptionExpiry {
     [CmdletBinding()]
     param(
-        [Parameter()]
-        [string]$Target
+        [Parameter(Mandatory)]
+        [object]$Exception
     )
 
-    # Returns the lower-case mail address inside a forwarding target, or $null if there is none.
-    # An address in angle brackets wins over any display text in front of it.
-    if ([string]::IsNullOrWhiteSpace($Target)) {
-        return $null
+    # State is None (no expiry), Valid (Date holds the last day the exception counts) or Unreadable.
+    # A blank or whitespace-only ExpirationDate means the exception does not expire. Any other value must be
+    # exactly yyyy-MM-dd (a date, no time, no offset), read the same way under every culture.
+    $text = [string]$Exception.ExpirationDate
+    if ([string]::IsNullOrWhiteSpace($text)) {
+        return [pscustomobject]@{ State = "None"; Date = $null }
     }
 
-    $clean = $Target.Trim()
-    if ($clean -match "SMTP:([^>\s]+@[^>\s]+)") {
-        $clean = $Matches[1]
-    }
-    elseif ($clean -match "<([^<>\s]+@[^<>\s]+)>") {
-        $clean = $Matches[1]
-    }
-    elseif ($clean -match "([^<>\s]+@[^<>\s]+)") {
-        $clean = $Matches[1]
+    $date = [datetime]::MinValue
+    $isReadable = [datetime]::TryParseExact(
+        $text,
+        "yyyy-MM-dd",
+        [System.Globalization.CultureInfo]::InvariantCulture,
+        [System.Globalization.DateTimeStyles]::None,
+        [ref]$date)
+
+    if ($isReadable) {
+        return [pscustomobject]@{ State = "Valid"; Date = $date }
     }
 
-    $mailAddress = $null
-    if ([System.Net.Mail.MailAddress]::TryCreate($clean, [ref]$mailAddress)) {
-        return $mailAddress.Address.ToLowerInvariant()
-    }
-
-    if ($clean -like "*@*") {
-        return $clean.ToLowerInvariant()
-    }
-
-    return $null
+    return [pscustomobject]@{ State = "Unreadable"; Date = $null }
 }
 
 function Test-M365ApprovedException {
@@ -206,68 +245,60 @@ function Test-M365ApprovedException {
         return $false
     }
 
+    $ordinal = [System.StringComparison]::OrdinalIgnoreCase
     $today = (Get-Date).Date
-    $normalizedUser = $UserPrincipalName.ToLowerInvariant()
-    $normalizedTarget = $Target.Trim().ToLowerInvariant()
+    $targetText = $Target.Trim()
     $targetAddress = Get-M365TargetAddress -Target $Target
     $targetDomain = if ($targetAddress) {
         $targetAddress.Substring($targetAddress.LastIndexOf("@") + 1)
     }
     else {
-        Get-M365TargetDomain -Target $Target
+        $null
     }
 
     foreach ($exception in $ApprovedExceptions) {
         $exceptionUser = [string]$exception.UserPrincipalName
-        $exceptionTarget = [string]$exception.ApprovedTarget
+        $exceptionTarget = ([string]$exception.ApprovedTarget).Trim()
         if ([string]::IsNullOrWhiteSpace($exceptionUser) -or [string]::IsNullOrWhiteSpace($exceptionTarget)) {
             continue
         }
 
-        if ($exceptionUser.ToLowerInvariant() -ne $normalizedUser) {
+        if (-not [string]::Equals($exceptionUser, $UserPrincipalName, $ordinal)) {
             continue
         }
 
-        # A blank or whitespace-only ExpirationDate means the exception does not expire.
-        # Any other value must be exactly yyyy-MM-dd (a date, no time, no offset), read the same way
-        # under every culture. A value in any other form fails closed: the exception is skipped,
-        # so it never approves anything. The exception is valid through the end of its expiry day.
-        $expirationText = [string]$exception.ExpirationDate
-        if (-not [string]::IsNullOrWhiteSpace($expirationText)) {
-            $expires = [datetime]::MinValue
-            $isReadable = [datetime]::TryParseExact(
-                $expirationText,
-                "yyyy-MM-dd",
-                [System.Globalization.CultureInfo]::InvariantCulture,
-                [System.Globalization.DateTimeStyles]::None,
-                [ref]$expires)
-            if (-not $isReadable -or $expires.Date -lt $today) {
-                continue
-            }
+        # An exception whose date cannot be read fails closed: it is skipped, so it never approves anything.
+        # It is valid through the end of its expiry day.
+        $expiry = Get-M365ExceptionExpiry -Exception $exception
+        if ($expiry.State -eq "Unreadable") {
+            continue
+        }
+        if ($expiry.State -eq "Valid" -and $expiry.Date.Date -lt $today) {
+            continue
         }
 
-        $normalizedExceptionTarget = $exceptionTarget.Trim().ToLowerInvariant()
-        if ($normalizedExceptionTarget -in @("*", "any")) {
+        # All comparisons below are ordinal, so a soft hyphen or zero-width character never makes two values equal.
+        if ([string]::Equals($exceptionTarget, "*", $ordinal) -or [string]::Equals($exceptionTarget, "any", $ordinal)) {
             return $true
         }
 
-        if ($normalizedExceptionTarget.Contains("@")) {
+        if ($exceptionTarget.Contains("@")) {
             # An ApprovedTarget with an at sign approves that exact address and nothing else.
             $exceptionAddress = Get-M365TargetAddress -Target $exceptionTarget
-            if ($exceptionAddress -and $targetAddress -and $exceptionAddress -eq $targetAddress) {
+            if ($exceptionAddress -and $targetAddress -and [string]::Equals($exceptionAddress, $targetAddress, $ordinal)) {
                 return $true
             }
             continue
         }
 
         # No at sign: a bare domain. It approves any address at exactly that domain, not its subdomains.
-        # A target that has no address in it (for example a recipient identity) must match the text exactly.
+        # A target that holds no address (for example a recipient identity) must match the text exactly.
         if ($targetDomain) {
-            if ($targetDomain -eq $normalizedExceptionTarget) {
+            if ([string]::Equals($targetDomain, $exceptionTarget, $ordinal)) {
                 return $true
             }
         }
-        elseif ($normalizedTarget -eq $normalizedExceptionTarget) {
+        elseif ([string]::Equals($targetText, $exceptionTarget, $ordinal)) {
             return $true
         }
     }
@@ -349,6 +380,38 @@ function Get-M365OutboundRiskLevel {
     return "Low"
 }
 
+function Get-M365NoMailboxPattern {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet("Mailbox", "InboxRules")]
+        [string]$Source
+    )
+
+    # What the two calls say when the account has no mailbox, as opposed to a call that failed.
+    # Exchange: the identity could not be found. Graph: MailboxNotEnabledForRESTAPI or ErrorItemNotFound.
+    if ($Source -eq "Mailbox") {
+        return "couldn.t be found|could not be found"
+    }
+
+    return "MailboxNotEnabledForRESTAPI|ErrorItemNotFound"
+}
+
+function Test-M365NoMailboxError {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [System.Management.Automation.ErrorRecord]$ErrorRecord,
+
+        [Parameter(Mandatory)]
+        [ValidateSet("Mailbox", "InboxRules")]
+        [string]$Source
+    )
+
+    $errorDetails = if ($ErrorRecord.ErrorDetails) { [string]$ErrorRecord.ErrorDetails.Message } else { "" }
+    return ("$($ErrorRecord.Exception.Message) $errorDetails" -match (Get-M365NoMailboxPattern -Source $Source))
+}
+
 function Get-M365BusinessHoursTimeZone {
     [CmdletBinding()]
     param(
@@ -426,9 +489,13 @@ Export-ModuleMember -Function @(
     "Write-M365MonitorError",
     "Invoke-M365CallWithRetry",
     "Get-M365TargetDomain",
+    "Get-M365TargetAddress",
     "Test-M365InternalDomain",
     "Test-M365PersonalDomain",
     "Test-M365ApprovedException",
+    "Get-M365ExceptionExpiry",
+    "Get-M365NoMailboxPattern",
+    "Test-M365NoMailboxError",
     "Get-M365ForwardingRiskLevel",
     "Get-M365OutboundRiskLevel",
     "Get-M365BusinessHoursTimeZone",

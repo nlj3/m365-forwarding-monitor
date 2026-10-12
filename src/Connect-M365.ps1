@@ -30,7 +30,7 @@ function Resolve-M365CertificatePath {
         return $CertificatePath
     }
 
-    return (Resolve-Path -Path $CertificatePath).Path
+    return (Resolve-Path -LiteralPath $CertificatePath).Path
 }
 
 function Get-M365AutomationCertificate {

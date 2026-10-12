@@ -23,7 +23,6 @@ function Get-M365OutboundMetadataCounts {
     $detectedAt = (Get-Date).ToString("o")
     $endDate = Get-Date
     $startDate = $endDate.AddHours(-1 * [int]$Settings.LookbackHours)
-    $internalDomains = @($Settings.InternalDomains | ForEach-Object { $_.ToLowerInvariant() })
     $results = [System.Collections.Generic.List[object]]::new()
 
     # One call returns the whole trace. If it fails, the scan has no outbound data, so it throws and the run stops.
@@ -49,7 +48,7 @@ function Get-M365OutboundMetadataCounts {
         $recipientDomain = Get-M365TargetDomain -Target $recipient
         $senderAddress -like "*@*" -and
         $recipient -like "*@*" -and
-        -not ($internalDomains -contains $recipientDomain)
+        -not (Test-M365InternalDomain -Domain $recipientDomain -InternalDomains $Settings.InternalDomains)
     })
 
     $grouped = $externalOutbound | Group-Object -Property SenderAddress
