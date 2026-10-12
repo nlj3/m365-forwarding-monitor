@@ -14,7 +14,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$resolvedProjectRoot = (Resolve-Path -Path $ProjectRoot).Path
+$resolvedProjectRoot = (Resolve-Path -LiteralPath $ProjectRoot).Path
 $outputPath = Join-Path $resolvedProjectRoot "output"
 $dashboardPath = Join-Path $outputPath "dashboard.html"
 $summaryPath = Join-Path $outputPath "summary.json"
@@ -94,7 +94,7 @@ function Get-UiFileTail {
         return ""
     }
 
-    return ((Get-Content -Path $Path -Tail $LineCount -ErrorAction SilentlyContinue) -join "`n")
+    return ((Get-Content -LiteralPath $Path -Tail $LineCount -ErrorAction SilentlyContinue) -join "`n")
 }
 
 function Get-UiSummary {
@@ -103,7 +103,7 @@ function Get-UiSummary {
     }
 
     try {
-        return (Get-Content -Path $summaryPath -Raw | ConvertFrom-Json)
+        return (Get-Content -LiteralPath $summaryPath -Raw | ConvertFrom-Json)
     }
     catch {
         return $null
@@ -160,12 +160,23 @@ function Test-UiScanRequest {
     # A web page on another site can make the browser send a POST to this local server.
     # So a request that names an origin must name this server's own, and the body must be declared as JSON,
     # which a page on another site cannot send without a cross-origin check that this server does not answer.
-    if ($null -ne $Origin -and ([string]$Origin).Trim().ToLowerInvariant() -ne "http://localhost:$Port") {
-        return [pscustomobject]@{ Allowed = $false; Reason = "The request came from a different origin." }
+    # The server's own origin has the port in it, except on port 80, where a browser leaves the port out.
+    # Ordinal comparison, because -eq and -in ignore soft hyphens and zero-width characters.
+    $ownOrigins = @("http://localhost:$Port")
+    if ($Port -eq 80) { $ownOrigins += "http://localhost" }
+    if ($null -ne $Origin) {
+        $originText = ([string]$Origin).Trim()
+        $isOwnOrigin = $false
+        foreach ($ownOrigin in $ownOrigins) {
+            if ([string]::Equals($ownOrigin, $originText, [System.StringComparison]::OrdinalIgnoreCase)) { $isOwnOrigin = $true }
+        }
+        if (-not $isOwnOrigin) {
+            return [pscustomobject]@{ Allowed = $false; Reason = "The request came from a different origin." }
+        }
     }
 
-    $mediaType = ([string]$ContentType -split ";")[0].Trim().ToLowerInvariant()
-    if ($mediaType -ne "application/json") {
+    $mediaType = ([string]$ContentType -split ";")[0].Trim()
+    if (-not [string]::Equals($mediaType, "application/json", [System.StringComparison]::OrdinalIgnoreCase)) {
         return [pscustomobject]@{ Allowed = $false; Reason = "The request must have Content-Type application/json." }
     }
 
@@ -189,7 +200,7 @@ function Start-UiScan {
         }
     }
 
-    "Starting metadata-only scan at $(Get-Date -Format o)" | Set-Content -Path $scanLogPath -Encoding UTF8
+    "Starting metadata-only scan at $(Get-Date -Format o)" | Set-Content -LiteralPath $scanLogPath -Encoding UTF8
     $script:ScanJob = Start-Job -Name "M365ForwardingMonitorScan" -ArgumentList $resolvedProjectRoot, $scanLogPath, $scanStatusPath -ScriptBlock {
         param(
             [string]$Root,
@@ -205,10 +216,10 @@ function Start-UiScan {
             FinishedAt = $null
             ExitCode = $null
             Message = "Scan running. Complete Microsoft device-code prompts if shown below."
-        } | ConvertTo-Json -Depth 5 | Set-Content -Path $StatusPath -Encoding UTF8
+        } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $StatusPath -Encoding UTF8
 
         try {
-            Set-Location -Path $Root
+            Set-Location -LiteralPath $Root
             $authVolume = "m365-forwarding-monitor_m365-ps-auth"
             & docker volume create $authVolume | Out-Null
             $containerName = "m365-forwarding-monitor-scan-$([guid]::NewGuid().ToString('N').Substring(0, 12))"
@@ -225,11 +236,11 @@ function Start-UiScan {
                 "m365-forwarding-monitor:local"
             )
 
-            "Command: docker $($dockerArgs -join ' ')" | Add-Content -Path $LogPath
-            "Privacy: metadata-only. No email bodies, subjects, previews, attachments, or message content are collected." | Add-Content -Path $LogPath
-            & docker @dockerArgs *>&1 | Tee-Object -FilePath $LogPath -Append
+            "Command: docker $($dockerArgs -join ' ')" | Add-Content -LiteralPath $LogPath
+            "Privacy: metadata-only. No email bodies, subjects, previews, attachments, or message content are collected." | Add-Content -LiteralPath $LogPath
+            & docker @dockerArgs *>&1 | Tee-Object -LiteralPath $LogPath -Append
             $exitCode = if ($null -ne $global:LASTEXITCODE) { [int]$global:LASTEXITCODE } else { 0 }
-            "Finished at $(Get-Date -Format o) with exit code $exitCode" | Add-Content -Path $LogPath
+            "Finished at $(Get-Date -Format o) with exit code $exitCode" | Add-Content -LiteralPath $LogPath
 
             [pscustomobject]@{
                 Running = $false
@@ -237,17 +248,17 @@ function Start-UiScan {
                 FinishedAt = (Get-Date).ToString("o")
                 ExitCode = $exitCode
                 Message = if ($exitCode -eq 0) { "Scan complete." } else { "Scan finished with errors. Check scan log and errors.log." }
-            } | ConvertTo-Json -Depth 5 | Set-Content -Path $StatusPath -Encoding UTF8
+            } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $StatusPath -Encoding UTF8
         }
         catch {
-            "Scan failed: $($_.Exception.Message)" | Add-Content -Path $LogPath
+            "Scan failed: $($_.Exception.Message)" | Add-Content -LiteralPath $LogPath
             [pscustomobject]@{
                 Running = $false
                 StartedAt = $startedAt
                 FinishedAt = (Get-Date).ToString("o")
                 ExitCode = 1
                 Message = $_.Exception.Message
-            } | ConvertTo-Json -Depth 5 | Set-Content -Path $StatusPath -Encoding UTF8
+            } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $StatusPath -Encoding UTF8
         }
     }
 
@@ -263,7 +274,7 @@ function Get-UiStatus {
     $scanLog = Get-UiFileTail -Path $scanLogPath -LineCount 160
     $scanStatus = $null
     if (Test-Path -LiteralPath $scanStatusPath) {
-        try { $scanStatus = Get-Content -Path $scanStatusPath -Raw | ConvertFrom-Json } catch { $scanStatus = $null }
+        try { $scanStatus = Get-Content -LiteralPath $scanStatusPath -Raw | ConvertFrom-Json } catch { $scanStatus = $null }
     }
 
     return [pscustomobject]@{
