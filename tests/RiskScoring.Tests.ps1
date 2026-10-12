@@ -3,7 +3,7 @@
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseDeclaredVarsMoreThanAssignments', '', Justification = 'Pester shares BeforeDiscovery and BeforeEach variables with It blocks.')]
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidGlobalVars', '', Justification = 'The stub functions are global so the script under test can call them, and they read the current scenario from one global variable.')]
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', '', Justification = 'The stub functions accept the same parameters as the commands they replace but do not need them.')]
-[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidOverwritingBuiltInCmdlets', '', Justification = 'The offline run replaces Start-Sleep with a no-op so failed calls do not wait between retries, and wraps Move-Item to record the order in which files are put in place.')]
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidOverwritingBuiltInCmdlets', '', Justification = 'The offline run replaces Start-Sleep with a no-op so failed calls do not wait between retries.')]
 param()
 
 # Unit tests for src/RiskScoring.psm1, plus an offline run of src/Invoke-ForwardingMonitor.ps1
@@ -113,9 +113,68 @@ Describe 'Get-M365TargetDomain' {
         @{ Name = 'display name only'; Target = 'Alex Wilber' }
         @{ Name = 'canonical recipient path'; Target = 'contoso.com/Staff/Alex Wilber' }
         @{ Name = 'address with nothing after the at sign'; Target = 'alex@' }
+        @{ Name = 'domain with no local part'; Target = '@contoso.com' }
+        @{ Name = 'two at signs in a row'; Target = 'alex@@contoso.com' }
+        @{ Name = 'a quoted local part that holds another address'; Target = '"a@contoso.com x"@evil.example.com' }
+        @{ Name = 'display text holding one address in front of another'; Target = 'Bob smtp:a@good.example.com <b@evil.example.com>' }
+        @{ Name = 'two addresses separated by a space'; Target = 'a@good.example.com b@evil.example.com' }
+        @{ Name = 'two addresses separated by a semicolon'; Target = 'b@evil.example.com;a@good.example.com' }
+        @{ Name = 'two addresses separated by a comma'; Target = 'a@good.example.com,b@evil.example.com' }
+        @{ Name = 'two SMTP: addresses'; Target = 'SMTP:alex@contoso.com;smtp:b@example.com' }
     ) {
         $result = Get-M365TargetDomain -Target $Target
         $result | Should -BeNullOrEmpty
+    }
+
+    It 'does not return a domain that only looks like a listed one: <Name>' -ForEach @(
+        @{ Name = 'soft hyphen in the domain'; Target = "alex@con`u{00AD}toso.com" }
+        @{ Name = 'zero-width space in the domain'; Target = "alex@contoso`u{200B}.com" }
+    ) {
+        $domain = Get-M365TargetDomain -Target $Target
+
+        [string]::Equals($domain, 'contoso.com', [System.StringComparison]::OrdinalIgnoreCase) | Should -BeFalse
+    }
+}
+
+Describe 'Get-M365TargetAddress' {
+    It 'returns the lower-cased address from every plain form: <Target>' -ForEach @(
+        @{ Target = 'alex@contoso.com' }
+        @{ Target = 'ALEX@Contoso.COM' }
+        @{ Target = '   alex@contoso.com   ' }
+        @{ Target = 'SMTP:alex@contoso.com' }
+        @{ Target = 'smtp:Alex@Contoso.com' }
+        @{ Target = 'sMtP: alex@contoso.com' }
+        @{ Target = 'Alex Wilber <alex@contoso.com>' }
+        @{ Target = '"Wilber, Alex" <alex@contoso.com>' }
+        @{ Target = '<alex@contoso.com>' }
+    ) {
+        Get-M365TargetAddress -Target $Target | Should -BeExactly 'alex@contoso.com'
+    }
+
+    It 'returns no address when the text holds none or more than one: <Name>' -ForEach @(
+        @{ Name = 'null'; Target = $null }
+        @{ Name = 'blank'; Target = '  ' }
+        @{ Name = 'no at sign'; Target = 'Alex Wilber' }
+        @{ Name = 'a quoted local part that holds another address'; Target = '"a@contoso.com x"@evil.example.com' }
+        @{ Name = 'display text holding one address in front of another'; Target = 'Bob smtp:a@good.example.com <b@evil.example.com>' }
+        @{ Name = 'two addresses separated by a space'; Target = 'a@good.example.com b@evil.example.com' }
+        @{ Name = 'two addresses separated by a semicolon'; Target = 'b@evil.example.com;a@good.example.com' }
+        @{ Name = 'two addresses separated by a comma'; Target = 'a@good.example.com, b@evil.example.com' }
+        @{ Name = 'two at signs in a row'; Target = 'a@@good.example.com' }
+        @{ Name = 'a bare at sign and domain'; Target = '@good.example.com' }
+    ) {
+        $result = Get-M365TargetAddress -Target $Target
+        $result | Should -BeNullOrEmpty
+    }
+
+    It 'does not return text that only looks like a plain address: <Name>' -ForEach @(
+        @{ Name = 'soft hyphen in the local part'; Target = "al`u{00AD}ice@good.example.com" }
+        @{ Name = 'zero-width space in the local part'; Target = "al`u{200B}ice@good.example.com" }
+        @{ Name = 'soft hyphen in the domain'; Target = "alice@good.exam`u{00AD}ple.com" }
+    ) {
+        $result = Get-M365TargetAddress -Target $Target
+
+        [string]::Equals($result, 'alice@good.example.com', [System.StringComparison]::OrdinalIgnoreCase) | Should -BeFalse
     }
 }
 
@@ -136,6 +195,8 @@ Describe 'Test-M365InternalDomain' {
         @{ Name = 'null domain'; Domain = $null; Internal = @('contoso.com') }
         @{ Name = 'whitespace domain'; Domain = '  '; Internal = @('contoso.com') }
         @{ Name = 'domain with padding spaces'; Domain = ' contoso.com '; Internal = @('contoso.com') }
+        @{ Name = 'soft hyphen inside a listed domain'; Domain = "con`u{00AD}toso.com"; Internal = @('contoso.com') }
+        @{ Name = 'zero-width space inside a listed domain'; Domain = "contoso`u{200B}.com"; Internal = @('contoso.com') }
         @{ Name = 'empty internal list'; Domain = 'contoso.com'; Internal = @() }
     ) {
         Test-M365InternalDomain -Domain $Domain -InternalDomains $Internal | Should -BeFalse
@@ -151,6 +212,8 @@ Describe 'Test-M365PersonalDomain' {
         @{ Name = 'subdomain of a listed domain'; Domain = 'mail.webmail.example.com'; List = @('webmail.example.com', 'FREEMAIL.example.com'); Expected = $false }
         @{ Name = 'null domain'; Domain = $null; List = @('webmail.example.com', 'FREEMAIL.example.com'); Expected = $false }
         @{ Name = 'empty domain'; Domain = ''; List = @('webmail.example.com', 'FREEMAIL.example.com'); Expected = $false }
+        @{ Name = 'soft hyphen inside a listed domain'; Domain = "web`u{00AD}mail.example.com"; List = @('webmail.example.com', 'FREEMAIL.example.com'); Expected = $false }
+        @{ Name = 'zero-width space inside a listed domain'; Domain = "webmail`u{200B}.example.com"; List = @('webmail.example.com', 'FREEMAIL.example.com'); Expected = $false }
         @{ Name = 'empty personal list'; Domain = 'webmail.example.com'; List = @(); Expected = $false }
     ) {
         Test-M365PersonalDomain -Domain $Domain -PersonalDomains $List | Should -Be $Expected
@@ -190,6 +253,12 @@ Describe 'Test-M365ApprovedException' {
         @{ Name = 'a domain that ends the same'; Target = 'bookkeeper@xpartner.example.com' }
         @{ Name = 'a matching display name in front of a different address'; Target = 'Bookkeeper <attacker@partner.example.com>' }
         @{ Name = 'the approved address as display text in front of a different address'; Target = 'bookkeeper@partner.example.com <attacker@partner.example.com>' }
+        @{ Name = 'a quoted local part that holds the approved address'; Target = '"bookkeeper@partner.example.com x"@evil.example.com' }
+        @{ Name = 'two addresses with a space between them'; Target = 'bookkeeper@partner.example.com attacker@evil.example.com' }
+        @{ Name = 'two addresses with a semicolon between them'; Target = 'attacker@evil.example.com;bookkeeper@partner.example.com' }
+        @{ Name = 'a soft hyphen in the local part'; Target = "book`u{00AD}keeper@partner.example.com" }
+        @{ Name = 'a zero-width space in the local part'; Target = "book`u{200B}keeper@partner.example.com" }
+        @{ Name = 'a soft hyphen in the domain'; Target = "bookkeeper@part`u{00AD}ner.example.com" }
     ) {
         $rows = @(Get-TestExceptionRow -Target 'bookkeeper@partner.example.com')
         Test-M365ApprovedException -UserPrincipalName 'alex@contoso.com' -Target $Target -ApprovedExceptions $rows | Should -BeFalse
@@ -228,6 +297,10 @@ Describe 'Test-M365ApprovedException' {
         @{ Name = 'a subdomain'; Target = 'anyone@mail.example.com'; Expected = $false }
         @{ Name = 'a longer domain that starts the same'; Target = 'anyone@example.com.example.com'; Expected = $false }
         @{ Name = 'a domain that ends the same'; Target = 'anyone@notexample.com'; Expected = $false }
+        @{ Name = 'a soft hyphen in the domain'; Target = "anyone@exam`u{00AD}ple.com"; Expected = $false }
+        @{ Name = 'a zero-width space in the domain'; Target = "anyone@example`u{200B}.com"; Expected = $false }
+        @{ Name = 'a quoted local part that holds an address at the domain'; Target = '"a@example.com x"@evil.example.com'; Expected = $false }
+        @{ Name = 'two addresses, one at the domain'; Target = 'anyone@example.com attacker@evil.example.com'; Expected = $false }
         @{ Name = 'a different domain'; Target = 'anyone@contoso.com'; Expected = $false }
     ) {
         $rows = @(Get-TestExceptionRow -Target 'Example.com')
@@ -323,6 +396,42 @@ Describe 'Test-M365ApprovedException' {
 
         { Test-M365ApprovedException -UserPrincipalName '' -Target 'x@example.com' -ApprovedExceptions @(Get-TestExceptionRow) } |
             Should -Throw
+    }
+}
+
+Describe 'Test-M365ApprovedException user names' {
+    It 'does not approve a user name that only looks like the one in the exception: <Name>' -ForEach @(
+        @{ Name = 'soft hyphen'; User = "al`u{00AD}ex@contoso.com" }
+        @{ Name = 'zero-width space'; User = "alex`u{200B}@contoso.com" }
+    ) {
+        $rows = @(Get-TestExceptionRow -User 'alex@contoso.com' -Target '*')
+        Test-M365ApprovedException -UserPrincipalName $User -Target 'x@example.com' -ApprovedExceptions $rows | Should -BeFalse
+    }
+
+    It 'treats a wildcard written with a lookalike character as an ordinary address, not a wildcard' {
+        $rows = @(Get-TestExceptionRow -Target "an`u{00AD}y")
+        Test-M365ApprovedException -UserPrincipalName 'alex@contoso.com' -Target 'x@example.com' -ApprovedExceptions $rows | Should -BeFalse
+    }
+}
+
+Describe 'Get-M365ExceptionExpiry' {
+    It 'reports the state and date of an expiry value: <Name>' -ForEach @(
+        @{ Name = 'blank'; Text = ''; State = 'None' }
+        @{ Name = 'whitespace'; Text = "  `t"; State = 'None' }
+        @{ Name = 'a plain date'; Text = '2099-12-31'; State = 'Valid' }
+        @{ Name = 'a date with a time'; Text = '2099-12-31T10:00:00Z'; State = 'Unreadable' }
+        @{ Name = 'a day-first date'; Text = '31.12.2099'; State = 'Unreadable' }
+        @{ Name = 'text'; Text = 'next year'; State = 'Unreadable' }
+    ) {
+        $expiry = Get-M365ExceptionExpiry -Exception (Get-TestExceptionRow -Expires $Text)
+
+        $expiry.State | Should -BeExactly $State
+        if ($State -eq 'Valid') { $expiry.Date | Should -Be ([datetime]'2099-12-31') }
+    }
+
+    It 'throws when the row has no ExpirationDate column' {
+        { Get-M365ExceptionExpiry -Exception ([pscustomobject]@{ UserPrincipalName = 'alex@contoso.com'; ApprovedTarget = '*' }) } |
+            Should -Throw -ExpectedMessage '*ExpirationDate*'
     }
 }
 
@@ -610,6 +719,31 @@ Describe 'Invoke-M365CallWithRetry' {
         Should -Invoke Start-Sleep -ModuleName RiskScoring -Times 0 -Exactly
     }
 
+    It 'stops at once and rethrows the original error when it matches NoRetryPattern' {
+        $thrown = $null
+        try {
+            Invoke-M365CallWithRetry -OperationName 'lookup' -OutputPath $outputPath -MaxAttempts 3 -ThrowOnFailure -NoRetryPattern 'not here' -ScriptBlock {
+                $state.Calls++
+                throw 'The thing is not here at all'
+            }
+        }
+        catch { $thrown = $_ }
+
+        $state.Calls | Should -Be 1
+        $thrown.Exception.Message | Should -BeExactly 'The thing is not here at all'
+        Should -Invoke Start-Sleep -ModuleName RiskScoring -Times 0 -Exactly
+        Join-Path $outputPath 'errors.log' | Should -Not -Exist
+    }
+
+    It 'still retries an error that does not match NoRetryPattern' {
+        $null = Invoke-M365CallWithRetry -OperationName 'lookup' -OutputPath $outputPath -MaxAttempts 3 -NoRetryPattern 'not here' -ScriptBlock {
+            $state.Calls++
+            throw 'a different failure'
+        }
+
+        $state.Calls | Should -Be 3
+    }
+
     It 'writes one errors.log line per failed attempt, tagged with the operation name' {
         $null = Invoke-M365CallWithRetry -OperationName 'Graph users list' -OutputPath $outputPath -MaxAttempts 3 -ScriptBlock { throw 'denied' }
 
@@ -618,6 +752,38 @@ Describe 'Invoke-M365CallWithRetry' {
         foreach ($attempt in 1, 2, 3) {
             $lines[$attempt - 1] | Should -BeLike "*Graph users list failed on attempt $attempt.*denied"
         }
+    }
+}
+
+Describe 'Test-M365NoMailboxError' {
+    It 'recognizes an account with no mailbox: <Name>' -ForEach @(
+        @{ Name = 'Exchange says the object could not be found'; Source = 'Mailbox'; Text = "The operation couldn't be performed because object 'alex@contoso.com' couldn't be found on 'DM1PR01'." }
+        @{ Name = 'Exchange, other wording'; Source = 'Mailbox'; Text = "The object 'alex@contoso.com' could not be found." }
+        @{ Name = 'Graph, mailbox not enabled for REST'; Source = 'InboxRules'; Text = '{"error":{"code":"MailboxNotEnabledForRESTAPI","message":"The mailbox is either inactive, soft-deleted, or is hosted on-premise."}}' }
+        @{ Name = 'Graph, item not found'; Source = 'InboxRules'; Text = '{"error":{"code":"ErrorItemNotFound","message":"The specified object was not found in the store."}}' }
+    ) {
+        $record = try { throw $Text } catch { $_ }
+
+        Test-M365NoMailboxError -ErrorRecord $record -Source $Source | Should -BeTrue
+    }
+
+    It 'reads the code from the error details as well as the message' {
+        $record = try { throw 'Response status code does not indicate success: 404' } catch { $_ }
+        $record.ErrorDetails = [System.Management.Automation.ErrorDetails]::new('{"error":{"code":"ErrorItemNotFound"}}')
+
+        Test-M365NoMailboxError -ErrorRecord $record -Source InboxRules | Should -BeTrue
+    }
+
+    It 'does not call anything else a missing mailbox: <Name>' -ForEach @(
+        @{ Name = 'a throttle'; Source = 'Mailbox'; Text = 'Too many requests' }
+        @{ Name = 'a timeout'; Source = 'InboxRules'; Text = 'The operation has timed out' }
+        @{ Name = 'a Graph code on the Exchange call'; Source = 'Mailbox'; Text = '{"error":{"code":"ErrorItemNotFound"}}' }
+        @{ Name = 'an Exchange message on the Graph call'; Source = 'InboxRules'; Text = "object 'a' couldn't be found" }
+        @{ Name = 'access denied'; Source = 'InboxRules'; Text = '{"error":{"code":"ErrorAccessDenied"}}' }
+    ) {
+        $record = try { throw $Text } catch { $_ }
+
+        Test-M365NoMailboxError -ErrorRecord $record -Source $Source | Should -BeFalse
     }
 }
 
@@ -823,6 +989,23 @@ Describe 'Get-M365OutboundMetadataCounts after-hours counting' {
         $global:TraceStub.LastResultSize | Should -BeExactly 'not called'
     }
 
+    It 'counts a recipient whose domain only looks internal as external' {
+        $original = $global:TraceStub.Rows
+        try {
+            $lookalike = Get-TraceRowAt -SenderAddress 'sender@contoso.com' -UtcText '2026-06-15 13:00:00'
+            $lookalike.RecipientAddress = "someone@con`u{00AD}toso.com"
+            $global:TraceStub.Rows = @($lookalike)
+
+            $counts = @(Get-M365OutboundMetadataCounts -Settings (Get-HoursSetting) -OutputPath (Join-Path $TestDrive 'hours-lookalike'))
+
+            $counts.Count | Should -Be 1
+            $counts[0].ExternalSentCount | Should -Be 1
+        }
+        finally {
+            $global:TraceStub.Rows = $original
+        }
+    }
+
     It 'asks for at most 5000 trace rows and reports no truncation for a short result' {
         $status = @{ Truncated = $false; RowCount = 0 }
 
@@ -866,6 +1049,16 @@ Describe 'Test-UiScanRequest in the local web interface' {
         $result.Reason | Should -BeLike '*origin*'
     }
 
+    It 'accepts an Origin with no port only when the server is on port 80: <Name>' -ForEach @(
+        @{ Name = 'port 80, no port in the origin'; Port = 80; Origin = 'http://localhost'; Expected = $true }
+        @{ Name = 'port 80, the port written out'; Port = 80; Origin = 'http://localhost:80'; Expected = $true }
+        @{ Name = 'port 80, another port'; Port = 80; Origin = 'http://localhost:81'; Expected = $false }
+        @{ Name = 'port 80, https'; Port = 80; Origin = 'https://localhost'; Expected = $false }
+        @{ Name = 'port 8181, no port in the origin'; Port = 8181; Origin = 'http://localhost'; Expected = $false }
+    ) {
+        (Test-UiScanRequest -Origin $Origin -ContentType 'application/json' -Port $Port).Allowed | Should -Be $Expected
+    }
+
     It 'rejects a body that is not declared as application/json: <Name>' -ForEach @(
         @{ Name = 'missing'; ContentType = $null }
         @{ Name = 'empty'; ContentType = '' }
@@ -893,7 +1086,7 @@ Describe 'Test-UiScanRequest in the local web interface' {
 Describe 'Local web interface over HTTP' {
     BeforeAll {
         $uiScript = Join-Path (Join-Path $PSScriptRoot '..') 'src/Start-ForwardingMonitorUi.ps1'
-        $projectRoot = Join-Path $TestDrive 'ui-project'
+        $projectRoot = Join-Path $TestDrive 'ui project [prod]'
         New-Item -ItemType Directory -Path $projectRoot -Force | Out-Null
 
         $probe = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
@@ -902,11 +1095,14 @@ Describe 'Local web interface over HTTP' {
         $probe.Stop()
 
         $uiLog = Join-Path $TestDrive 'ui-output.log'
+        # Each argument is quoted so that a path with a space or a bracket reaches the script intact.
+        $uiArguments = '-NoProfile -File "{0}" -ProjectRoot "{1}" -Port {2}' -f $uiScript, $projectRoot, $uiPort
         $uiProcess = Start-Process -FilePath (Get-Process -Id $PID).Path -PassThru -RedirectStandardOutput $uiLog -RedirectStandardError (Join-Path $TestDrive 'ui-error.log') `
-            -ArgumentList @('-NoProfile', '-File', $uiScript, '-ProjectRoot', $projectRoot, '-Port', $uiPort)
+            -ArgumentList $uiArguments
 
         $uiReady = $false
-        for ($attempt = 0; $attempt -lt 60 -and -not $uiReady; $attempt++) {
+        $uiDeadline = [datetime]::UtcNow.AddSeconds(30)
+        while (-not $uiReady -and [datetime]::UtcNow -lt $uiDeadline) {
             try {
                 $uiReady = (Invoke-WebRequest -Uri "http://localhost:$uiPort/api/status" -TimeoutSec 2 -SkipHttpErrorCheck).StatusCode -eq 200
             }
@@ -988,12 +1184,6 @@ Describe 'New-M365ForwardingDashboard warnings' {
         Get-DashboardText -Summary (Get-DashboardSummary) | Should -Not -BeLike '*Incomplete scan*'
     }
 
-    It 'renders a summary without the failure fields, as older runs wrote it, with no warning' {
-        $older = Get-DashboardSummary | Select-Object -Property * -ExcludeProperty CollectionFailures, TraceTruncated
-
-        Get-DashboardText -Summary $older | Should -Not -BeLike '*Incomplete scan*'
-    }
-
     It 'puts a warning with the counts and names at the top when collection failed' {
         $html = Get-DashboardText -Summary (Get-DashboardSummary -MailboxFailed @('a@contoso.com', 'b@contoso.com') -RuleFailed @('c@contoso.com'))
 
@@ -1003,13 +1193,33 @@ Describe 'New-M365ForwardingDashboard warnings' {
         $html.IndexOf('Incomplete scan') | Should -BeLessThan $html.IndexOf('Total users scanned')
     }
 
-    It 'encodes the user names it lists and caps a long list' {
-        $names = @('x<script>@contoso.com') + @(1..30 | ForEach-Object { "user$_@contoso.com" })
+    It 'lists every failed name: the first 25 in view and the rest inside a details element' {
+        $names = @(1..31 | ForEach-Object { "user$_@contoso.com" })
+        $html = Get-DashboardText -Summary (Get-DashboardSummary -MailboxFailed $names)
+
+        $detailsStart = $html.IndexOf('<details>')
+        $detailsStart | Should -BeGreaterThan 0
+        $html.IndexOf('user25@contoso.com') | Should -BeLessThan $detailsStart
+        $html.IndexOf('user26@contoso.com') | Should -BeGreaterThan $detailsStart
+        $html.IndexOf('user31@contoso.com') | Should -BeLessThan $html.IndexOf('</details>')
+        $html | Should -BeLike '*<summary>and 6 more</summary>*'
+    }
+
+    It 'adds no details element when the names fit in the first 25' {
+        $html = Get-DashboardText -Summary (Get-DashboardSummary -MailboxFailed @(1..25 | ForEach-Object { "user$_@contoso.com" }))
+
+        $html | Should -BeLike '*user25@contoso.com*'
+        $html | Should -Not -BeLike '*<details>*'
+    }
+
+    It 'encodes the user names it lists, inside and outside the details element' {
+        $names = @('x<script>@contoso.com') + @(1..29 | ForEach-Object { "user$_@contoso.com" }) + @('y<img>@contoso.com')
         $html = Get-DashboardText -Summary (Get-DashboardSummary -MailboxFailed $names)
 
         $html | Should -BeLike '*x&lt;script&gt;@contoso.com*'
+        $html | Should -BeLike '*y&lt;img&gt;@contoso.com*'
         $html | Should -Not -BeLike '*<script>@contoso.com*'
-        $html | Should -BeLike '*and 6 more*'
+        $html | Should -Not -BeLike '*<img>@contoso.com*'
     }
 
     It 'warns that outbound counts can be too low when the trace reached its row limit' {
@@ -1017,6 +1227,30 @@ Describe 'New-M365ForwardingDashboard warnings' {
 
         $html | Should -BeLike '*Incomplete scan*'
         $html | Should -BeLike '*message trace reached its row limit*'
+    }
+
+    It 'says that forwards found by an earlier scan are kept and marked when users could not be read' {
+        Get-DashboardText -Summary (Get-DashboardSummary -RuleFailed @('c@contoso.com')) | Should -BeLike '*earlier scan*marked not re-checked*'
+        Get-DashboardText -Summary (Get-DashboardSummary -Truncated $true) | Should -Not -BeLike '*not re-checked*'
+    }
+
+    It 'marks a finding kept from an earlier scan as not re-checked in the risky users table, and no other finding' {
+        $findings = @(
+            [pscustomobject]@{ UserPrincipalName = 'alice.ng@contoso.com'; ForwardingType = 'MailboxForwarding'; ForwardTarget = 'alice.home@webmail.example.com'
+                TargetDomain = 'webmail.example.com'; IsExternal = $true; RiskLevel = 'Critical'; DetectedAt = '2026-01-05T09:00:00.0000000Z'; NotRechecked = $true }
+            [pscustomobject]@{ UserPrincipalName = 'bob.diaz@contoso.com'; ForwardingType = 'InboxRuleForward'; ForwardTarget = 'invoices@vendor.example.com'
+                TargetDomain = 'vendor.example.com'; IsExternal = $true; RiskLevel = 'High'; DetectedAt = '2026-01-06T09:00:00.0000000Z'; NotRechecked = $false }
+            # A finding without the property, as an older version wrote them.
+            [pscustomobject]@{ UserPrincipalName = 'carol.otieno@contoso.com'; ForwardingType = 'MailboxForwarding'; ForwardTarget = 'records@partner.example.com'
+                TargetDomain = 'partner.example.com'; IsExternal = $true; RiskLevel = 'High'; DetectedAt = '2026-01-06T09:00:00.0000000Z' }
+        )
+        $path = New-M365ForwardingDashboard -Summary (Get-DashboardSummary -MailboxFailed @('alice.ng@contoso.com')) -ForwardingFindings $findings `
+            -OutboundCounts @() -OutputPath (Join-Path $TestDrive 'risky-table')
+        $rows = @([regex]::Matches((Get-Content -LiteralPath $path -Raw), '<tr><td>[^<]+@contoso\.com</td>.*?</tr>') | ForEach-Object Value)
+
+        $rows.Count | Should -Be 3
+        @($rows | Where-Object { $_ -like '*alice.ng@contoso.com*' }) | Should -BeLike '*not re-checked*'
+        @($rows | Where-Object { $_ -like '*not re-checked*' }).Count | Should -Be 1
     }
 }
 
@@ -1042,7 +1276,7 @@ Describe 'Invoke-ForwardingMonitor.ps1 run against stubbed Microsoft calls' {
         $expectedFindingColumns = @(
             'UserPrincipalName', 'DisplayName', 'ForwardingType', 'ForwardTarget', 'TargetDomain', 'IsExternal',
             'IsPersonalDomain', 'ApprovedException', 'RiskLevel', 'DetectedAt',
-            'DeliverToMailboxAndForward', 'RuleName', 'RuleId', 'RuleEnabled'
+            'DeliverToMailboxAndForward', 'RuleName', 'RuleId', 'RuleEnabled', 'NotRechecked'
         )
 
         # The stubs stand in for Invoke-MgGraphRequest, Get-Mailbox and Get-MessageTraceV2.
@@ -1050,8 +1284,16 @@ Describe 'Invoke-ForwardingMonitor.ps1 run against stubbed Microsoft calls' {
         function global:Invoke-MgGraphRequest {
             [CmdletBinding()]
             param($Method, $Uri)
+            $global:OfflineRun.GraphCalls = 1 + [int]$global:OfflineRun.GraphCalls
             if ($Uri -match '/users/(?<upn>[^/]+)/mailFolders/inbox/messageRules$') {
                 $ruleUpn = $Matches['upn']
+                $global:OfflineRun.RuleCalls = @($global:OfflineRun.RuleCalls | Where-Object { $_ }) + $ruleUpn
+                if ($global:OfflineRun.RulesNoMailbox -contains $ruleUpn) {
+                    throw '{"error":{"code":"MailboxNotEnabledForRESTAPI","message":"The mailbox is either inactive, soft-deleted, or is hosted on-premise."}}'
+                }
+                if ($global:OfflineRun.RulesItemNotFound -contains $ruleUpn) {
+                    throw '{"error":{"code":"ErrorItemNotFound","message":"The specified object was not found in the store."}}'
+                }
                 if ($global:OfflineRun.RuleErrors -contains $ruleUpn) { throw "Graph rules call failed for $ruleUpn" }
                 $rules = $global:OfflineRun.Rules[$ruleUpn]
                 return @{ value = @($rules | Where-Object { $_ }) }
@@ -1062,6 +1304,10 @@ Describe 'Invoke-ForwardingMonitor.ps1 run against stubbed Microsoft calls' {
         function global:Get-Mailbox {
             [CmdletBinding()]
             param($Identity)
+            $global:OfflineRun.MailboxCalls = @($global:OfflineRun.MailboxCalls | Where-Object { $_ }) + $Identity
+            if ($global:OfflineRun.NoMailbox -contains $Identity) {
+                throw "The operation couldn't be performed because object '$Identity' couldn't be found on 'DM1PR01'."
+            }
             if ($global:OfflineRun.MailboxErrors -contains $Identity) { throw "Mailbox $Identity is unavailable" }
             $forwardTo = $global:OfflineRun.Mailboxes[$Identity]
             $user = @($global:OfflineRun.Users | Where-Object { $_.userPrincipalName -eq $Identity })[0]
@@ -1085,12 +1331,6 @@ Describe 'Invoke-ForwardingMonitor.ps1 run against stubbed Microsoft calls' {
         function global:Start-Sleep {
             [CmdletBinding()]
             param($Seconds, $Milliseconds)
-        }
-        function global:Move-Item {
-            [CmdletBinding()]
-            param($LiteralPath, $Destination, [switch]$Force)
-            $global:MoveLog += (Split-Path -Leaf $Destination)
-            Microsoft.PowerShell.Management\Move-Item -LiteralPath $LiteralPath -Destination $Destination -Force:$Force
         }
 
         function Get-OfflineUser {
@@ -1127,7 +1367,7 @@ Describe 'Invoke-ForwardingMonitor.ps1 run against stubbed Microsoft calls' {
         }
 
         function Invoke-OfflineMonitorRun {
-            param([string]$Name, [hashtable]$Scenario, [string]$ExceptionTarget, [scriptblock]$Seed)
+            param([string]$Name, [hashtable]$Scenario, [string]$ExceptionTarget, [scriptblock]$Seed, [string]$ExceptionExpiration, [hashtable]$SettingsOverride = @{}, [switch]$CaptureVerbose)
 
             $global:OfflineRun = $Scenario
             $runRoot = Join-Path $TestDrive $Name
@@ -1135,7 +1375,7 @@ Describe 'Invoke-ForwardingMonitor.ps1 run against stubbed Microsoft calls' {
             New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
             if ($Seed) { & $Seed $outputDir }
 
-            [ordered]@{
+            $settingsValues = [ordered]@{
                 TenantId                   = '00000000-0000-0000-0000-000000000000'
                 InternalDomains            = @('contoso.com', 'contoso.onmicrosoft.com')
                 PersonalDomains            = @('webmail.example.com')
@@ -1151,18 +1391,34 @@ Describe 'Invoke-ForwardingMonitor.ps1 run against stubbed Microsoft calls' {
                 BusinessHoursEnd           = 18
                 OutputPath                 = $outputDir
                 PrivacyMode                = $true
-            } | ConvertTo-Json | Set-Content -Path (Join-Path $runRoot 'settings.json')
+            }
+            foreach ($key in $SettingsOverride.Keys) { $settingsValues[$key] = $SettingsOverride[$key] }
+            $settingsValues | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $runRoot 'settings.json')
 
             [pscustomobject]@{
                 UserPrincipalName = 'alex.wilber@contoso.com'
                 ApprovedTarget    = $ExceptionTarget
                 Reason            = 'Synthetic test row'
                 ApprovedBy        = 'security.manager@contoso.com'
-                ExpirationDate    = (Get-Date).AddDays(30).ToString('yyyy-MM-dd', [cultureinfo]::InvariantCulture)
-            } | Export-Csv -Path (Join-Path $runRoot 'exceptions.csv') -NoTypeInformation
+                ExpirationDate    = if ($ExceptionExpiration) { $ExceptionExpiration } else { (Get-Date).AddDays(30).ToString('yyyy-MM-dd', [cultureinfo]::InvariantCulture) }
+            } | Export-Csv -LiteralPath (Join-Path $runRoot 'exceptions.csv') -NoTypeInformation
 
-            & $monitorScript -SettingsPath (Join-Path $runRoot 'settings.json') `
-                -ApprovedExceptionsPath (Join-Path $runRoot 'exceptions.csv') -SkipConnect 6>$null 3>$null
+            $global:LASTEXITCODE = 0
+            $arguments = @{
+                SettingsPath           = Join-Path $runRoot 'settings.json'
+                ApprovedExceptionsPath = Join-Path $runRoot 'exceptions.csv'
+                SkipConnect            = $true
+            }
+            if ($CaptureVerbose) {
+                # The script says "Put <file> in place." on the verbose stream as it replaces each output file.
+                $Scenario.Published = @(& $monitorScript @arguments -Verbose 4>&1 6>$null 3>$null | ForEach-Object {
+                        if ($_ -is [System.Management.Automation.VerboseRecord] -and $_.Message -match '^Put (?<leaf>.+) in place\.$') { $Matches['leaf'] }
+                    })
+            }
+            else {
+                & $monitorScript @arguments 6>$null 3>$null
+            }
+            $Scenario.ExitCode = $LASTEXITCODE
             return $outputDir
         }
 
@@ -1177,8 +1433,8 @@ Describe 'Invoke-ForwardingMonitor.ps1 run against stubbed Microsoft calls' {
     }
 
     AfterAll {
-        Remove-Item -Path Function:\global:Invoke-MgGraphRequest, Function:\global:Get-Mailbox, Function:\global:Get-MessageTraceV2, Function:\global:Start-Sleep, Function:\global:Move-Item -ErrorAction SilentlyContinue
-        Remove-Variable -Name OfflineRun, MoveLog -Scope Global -ErrorAction SilentlyContinue
+        Remove-Item -Path Function:\global:Invoke-MgGraphRequest, Function:\global:Get-Mailbox, Function:\global:Get-MessageTraceV2, Function:\global:Start-Sleep -ErrorAction SilentlyContinue
+        Remove-Variable -Name OfflineRun -Scope Global -ErrorAction SilentlyContinue
     }
 
     Context 'with mailbox forwarding, an approved exception and hostile display names' {
@@ -1204,9 +1460,8 @@ Describe 'Invoke-ForwardingMonitor.ps1 run against stubbed Microsoft calls' {
                     (Get-OfflineTrace -SenderAddress '=ops@contoso.com' -Recipient 'c@vendor.example.com')
                 )
             }
-            $global:MoveLog = @()
-            $outputDir = Invoke-OfflineMonitorRun -Name 'mailbox' -Scenario $scenario -ExceptionTarget 'records@partner.example.com'
-            $moved = @($global:MoveLog)
+            $outputDir = Invoke-OfflineMonitorRun -Name 'mailbox' -Scenario $scenario -ExceptionTarget 'records@partner.example.com' -CaptureVerbose
+            $moved = @($scenario.Published)
         }
 
         It 'puts the eight output files in place with the dashboard last' {
@@ -1235,13 +1490,23 @@ Describe 'Invoke-ForwardingMonitor.ps1 run against stubbed Microsoft calls' {
         It 'records no collection failures, asks the trace for 5000 rows, leaves no temporary files and shows no warning' {
             $summary = Get-Content -Path (Join-Path $outputDir 'summary.json') -Raw | ConvertFrom-Json
 
+            $scenario.ExitCode | Should -Be 0
+            $summary.UsersWithoutMailbox.Count | Should -Be 0
             $summary.TraceTruncated | Should -BeFalse
             $summary.CollectionFailures.MailboxForwarding.Count | Should -Be 0
             $summary.CollectionFailures.InboxRules.Count | Should -Be 0
             @($summary.CollectionFailures.MailboxForwarding.UserPrincipalNames).Count | Should -Be 0
             $scenario.LastResultSize | Should -Be 5000
-            @(Get-ChildItem -LiteralPath $outputDir -Force -Filter '*.tmp').Count | Should -Be 0
+            @(Get-ChildItem -LiteralPath $outputDir -Force | Where-Object Name -match '\.(tmp|prev)$').Count | Should -Be 0
+            Join-Path $outputDir '.scan.lock' | Should -Not -Exist
             Get-Content -Path (Join-Path $outputDir 'dashboard.html') -Raw | Should -Not -BeLike '*Incomplete scan*'
+        }
+
+        It 'marks every finding as checked in this run' {
+            $findings = @(Get-Content -Path (Join-Path $outputDir 'forwarding-findings.json') -Raw | ConvertFrom-Json)
+
+            @($findings | Where-Object { $_.NotRechecked -ne $false }).Count | Should -Be 0
+            @(Import-Csv -Path (Join-Path $outputDir 'forwarding-findings.csv') | Select-Object -ExpandProperty NotRechecked -Unique) | Should -Be @('False')
         }
 
         It 'labels the findings: the approved one as Exception and the personal-domain one as Critical' {
@@ -1591,6 +1856,12 @@ Describe 'Invoke-ForwardingMonitor.ps1 run against stubbed Microsoft calls' {
             $outputDir = Invoke-OfflineMonitorRun -Name 'partial' -Scenario $scenario -ExceptionTarget 'nobody@partner.example.com'
         }
 
+        It 'exits with code 2 and retried each failing user three times before counting it' {
+            $scenario.ExitCode | Should -Be 2
+            @($scenario.MailboxCalls | Where-Object { $_ -eq 'sam.okafor@contoso.com' }).Count | Should -Be 3
+            @($scenario.RuleCalls | Where-Object { $_ -eq 'priya.nair@contoso.com' }).Count | Should -Be 3
+        }
+
         It 'completes and counts each failure by collector with the user names in summary.json' {
             $summary = Get-Content -Path (Join-Path $outputDir 'summary.json') -Raw | ConvertFrom-Json
 
@@ -1686,5 +1957,741 @@ Describe 'Invoke-ForwardingMonitor.ps1 run against stubbed Microsoft calls' {
             $html | Should -BeLike '*Incomplete scan*'
             $html | Should -BeLike '*message trace reached its row limit*'
         }
+    }
+
+    Context 'with accounts that have no mailbox' {
+        BeforeAll {
+            $scenario = @{
+                Users             = @(
+                    (Get-OfflineUser -Name 'alex.wilber' -DisplayName 'Alex Wilber')
+                    (Get-OfflineUser -Name 'sam.okafor' -DisplayName 'Sam Okafor')
+                    (Get-OfflineUser -Name 'priya.nair' -DisplayName 'Priya Nair')
+                    (Get-OfflineUser -Name 'chris.lindqvist' -DisplayName 'Chris Lindqvist')
+                )
+                Mailboxes         = @{ 'alex.wilber@contoso.com' = 'smtp:records@partner.example.com' }
+                Rules             = @{ 'chris.lindqvist@contoso.com' = @((Get-OfflineRule -Name 'Copy invoices' -Target 'invoices@vendor.example.com')) }
+                Traces            = @((Get-OfflineTrace -SenderAddress 'alex.wilber@contoso.com' -Recipient 'a@vendor.example.com'))
+                NoMailbox         = @('sam.okafor@contoso.com')
+                RulesNoMailbox    = @('sam.okafor@contoso.com')
+                RulesItemNotFound = @('priya.nair@contoso.com')
+            }
+            $outputDir = Invoke-OfflineMonitorRun -Name 'no-mailbox' -Scenario $scenario -ExceptionTarget 'nobody@partner.example.com'
+        }
+
+        It 'is not a failure: the run exits 0 and records no collection failures' {
+            $summary = Get-Content -Path (Join-Path $outputDir 'summary.json') -Raw | ConvertFrom-Json
+
+            $scenario.ExitCode | Should -Be 0
+            $summary.CollectionFailures.MailboxForwarding.Count | Should -Be 0
+            $summary.CollectionFailures.InboxRules.Count | Should -Be 0
+            Get-Content -Path (Join-Path $outputDir 'dashboard.html') -Raw | Should -Not -BeLike '*Incomplete scan*'
+        }
+
+        It 'lists each such account once under UsersWithoutMailbox, in summary.json and as a count in summary.csv' {
+            $summary = Get-Content -Path (Join-Path $outputDir 'summary.json') -Raw | ConvertFrom-Json
+
+            $summary.UsersWithoutMailbox.Count | Should -Be 2
+            @($summary.UsersWithoutMailbox.UserPrincipalNames | Sort-Object) | Should -Be @('priya.nair@contoso.com', 'sam.okafor@contoso.com')
+            @(Import-Csv -Path (Join-Path $outputDir 'summary.csv'))[0].UsersWithoutMailbox | Should -BeExactly '2'
+        }
+
+        It 'does not retry a missing mailbox' {
+            @($scenario.MailboxCalls | Where-Object { $_ -eq 'sam.okafor@contoso.com' }).Count | Should -Be 1
+            @($scenario.RuleCalls | Where-Object { $_ -eq 'sam.okafor@contoso.com' }).Count | Should -Be 1
+            @($scenario.RuleCalls | Where-Object { $_ -eq 'priya.nair@contoso.com' }).Count | Should -Be 1
+        }
+
+        It 'still reports what it could read for the other users' {
+            $findings = @(Get-Content -Path (Join-Path $outputDir 'forwarding-findings.json') -Raw | ConvertFrom-Json)
+
+            $findings.Count | Should -Be 2
+        }
+    }
+
+    Context 'when the business time zone is not a known id' {
+        BeforeAll {
+            $scenario = @{
+                Users = @((Get-OfflineUser -Name 'alex.wilber' -DisplayName 'Alex Wilber')); Mailboxes = @{}; Rules = @{}
+                Traces = @((Get-OfflineTrace -SenderAddress 'alex.wilber@contoso.com' -Recipient 'a@vendor.example.com'))
+            }
+            $thrown = $null
+            try { $null = Invoke-OfflineMonitorRun -Name 'bad-zone' -Scenario $scenario -ExceptionTarget 'nobody@partner.example.com' -SettingsOverride @{ BusinessHoursTimeZone = 'Nowhere/Land' } }
+            catch { $thrown = $_ }
+            $runRoot = Join-Path $TestDrive 'bad-zone'
+        }
+
+        It 'stops before it asks Microsoft for anything' {
+            $thrown | Should -Not -BeNullOrEmpty
+            $thrown.Exception.Message | Should -BeLike "*BusinessHoursTimeZone 'Nowhere/Land'*"
+            [int]$scenario.GraphCalls | Should -Be 0
+            @($scenario.MailboxCalls | Where-Object { $_ }).Count | Should -Be 0
+        }
+
+        It 'records the stop in errors.log and writes no report file' {
+            Get-Content -Path (Join-Path $runRoot 'output/errors.log') -Raw | Should -BeLike "*BusinessHoursTimeZone 'Nowhere/Land'*"
+            @(Get-ChildItem -LiteralPath (Join-Path $runRoot 'output') -File -Force | Where-Object Name -ne 'errors.log').Count | Should -Be 0
+        }
+    }
+
+    Context 'when an approved exception has an expiry date the tool cannot read' {
+        BeforeAll {
+            $scenario = @{
+                Users     = @((Get-OfflineUser -Name 'alex.wilber' -DisplayName 'Alex Wilber'))
+                Mailboxes = @{ 'alex.wilber@contoso.com' = 'smtp:records@partner.example.com' }
+                Rules     = @{ 'alex.wilber@contoso.com' = @((Get-OfflineRule -Name 'Copy to partner' -Target 'records@partner.example.com')) }
+                Traces    = @((Get-OfflineTrace -SenderAddress 'alex.wilber@contoso.com' -Recipient 'a@vendor.example.com'))
+            }
+            $outputDir = Invoke-OfflineMonitorRun -Name 'bad-expiry' -Scenario $scenario -ExceptionTarget 'records@partner.example.com' -ExceptionExpiration '31.12.2099'
+        }
+
+        It 'does not approve the forward, so it is reported at its real level' {
+            $findings = @(Get-Content -Path (Join-Path $outputDir 'forwarding-findings.json') -Raw | ConvertFrom-Json)
+
+            $findings.Count | Should -Be 2
+            @($findings | Where-Object ApprovedException).Count | Should -Be 0
+            @($findings | Select-Object -ExpandProperty RiskLevel -Unique) | Should -Be @('High')
+        }
+
+        It 'logs the skipped row once for the run, with the user and the raw value, however many findings it would have covered' {
+            $lines = @(Get-Content -Path (Join-Path $outputDir 'errors.log') | Where-Object { $_ -like "*ExpirationDate '31.12.2099'*" })
+
+            $lines.Count | Should -Be 1
+            $lines[0] | Should -BeLike '*alex.wilber@contoso.com*'
+            $lines[0] | Should -BeLike '*yyyy-MM-dd*'
+        }
+    }
+
+    Context 'when the output folder name contains brackets' {
+        BeforeAll {
+            $scenario = @{
+                Users     = @((Get-OfflineUser -Name 'alex.wilber' -DisplayName 'Alex Wilber'))
+                Mailboxes = @{ 'alex.wilber@contoso.com' = 'smtp:records@partner.example.com' }
+                Rules     = @{}
+                Traces    = @((Get-OfflineTrace -SenderAddress 'alex.wilber@contoso.com' -Recipient 'a@vendor.example.com'))
+            }
+            $outputDir = Invoke-OfflineMonitorRun -Name 'Scans [prod]' -Scenario $scenario -ExceptionTarget 'nobody@partner.example.com' -ExceptionExpiration 'not-a-date'
+            $null = Invoke-OfflineMonitorRun -Name 'Scans [prod]' -Scenario $scenario -ExceptionTarget 'nobody@partner.example.com' -ExceptionExpiration 'not-a-date'
+        }
+
+        It 'writes every report file into the folder' {
+            $outputDir | Should -BeLike '*Scans `[prod`]*'
+            foreach ($file in 'summary.json', 'forwarding-findings.json', 'forwarding-findings.csv', 'outbound-metadata-counts.json',
+                'outbound-metadata-counts.csv', 'summary.csv', 'outbound-baseline-history.json', 'dashboard.html') {
+                [System.IO.File]::Exists((Join-Path $outputDir $file)) | Should -BeTrue -Because "$file should be in the folder"
+            }
+        }
+
+        It 'finds the baseline history again on the second run instead of starting over' {
+            $history = Get-Content -LiteralPath (Join-Path $outputDir 'outbound-baseline-history.json') -Raw | ConvertFrom-Json -NoEnumerate
+            $log = Get-Content -LiteralPath (Join-Path $outputDir 'errors.log') -Raw -ErrorAction SilentlyContinue
+
+            $history.Count | Should -Be 2
+            $log | Should -Not -BeLike '*Could not read outbound baseline history*'
+        }
+
+        It 'writes errors.log into the folder' {
+            $lines = @(Get-Content -LiteralPath (Join-Path $outputDir 'errors.log') | Where-Object { $_ -like "*ExpirationDate 'not-a-date'*" })
+
+            $lines.Count | Should -Be 2
+        }
+
+        It 'documents the exit codes in the script help' {
+            $help = Get-Help (Join-Path (Join-Path $PSScriptRoot '..') 'src/Invoke-ForwardingMonitor.ps1') -Full | Out-String
+
+            $help | Should -BeLike '*0*clean*'
+            $help | Should -BeLike '*1*stopped*'
+            $help | Should -BeLike '*2*partial*'
+        }
+    }
+
+    Context 'when another program holds forwarding-findings.csv open while the files are put in place' {
+        BeforeAll {
+            $users = @((Get-OfflineUser -Name 'alex.wilber' -DisplayName 'Alex Wilber'), (Get-OfflineUser -Name 'sam.okafor' -DisplayName 'Sam Okafor'))
+            $first = @{ Users = $users; Mailboxes = @{ 'alex.wilber@contoso.com' = 'smtp:records@partner.example.com' }; Rules = @{}
+                Traces = @((Get-OfflineTrace -SenderAddress 'alex.wilber@contoso.com' -Recipient 'a@vendor.example.com')) }
+            $outputDir = Invoke-OfflineMonitorRun -Name 'csv-held' -Scenario $first -ExceptionTarget 'nobody@partner.example.com'
+            $before = Get-OutputSnapshot -Directory $outputDir
+
+            # The fourth file staged is held open with no sharing, the way the reviewer locked it. On Windows the open
+            # handle blocks the copy and the replace; on Linux and macOS .NET takes an exclusive lock that blocks the copy.
+            $changed = @{ Users = $users; Mailboxes = @{ 'sam.okafor@contoso.com' = 'smtp:sam.home@webmail.example.com' }; Rules = @{}
+                Traces = @((Get-OfflineTrace -SenderAddress 'sam.okafor@contoso.com' -Recipient 'b@vendor.example.com')) }
+            $holder = [System.IO.FileStream]::new((Join-Path $outputDir 'forwarding-findings.csv'), 'Open', 'ReadWrite', 'None')
+            $thrown = $null
+            try { $null = Invoke-OfflineMonitorRun -Name 'csv-held' -Scenario $changed -ExceptionTarget 'nobody@partner.example.com' }
+            catch { $thrown = $_ }
+            finally { $holder.Dispose() }
+            $after = Get-OutputSnapshot -Directory $outputDir
+        }
+
+        It 'stops the run with a message that names the file and says the earlier files were put back' {
+            $thrown | Should -Not -BeNullOrEmpty
+            $thrown.Exception.Message | Should -BeLike "*forwarding-findings.csv in place*The previous run's files were put back*"
+        }
+
+        It 'puts back the files it had already replaced, so the folder holds the previous run and no temporary file or backup' {
+            $after | Should -BeExactly $before
+        }
+
+        It 'records the stop in errors.log' {
+            Get-Content -LiteralPath (Join-Path $outputDir 'errors.log') -Raw | Should -BeLike '*Invoke-ForwardingMonitor failed.*forwarding-findings.csv in place*'
+        }
+    }
+
+    Context 'when a folder sits where outbound-metadata-counts.json goes' {
+        BeforeAll {
+            $users = @((Get-OfflineUser -Name 'alex.wilber' -DisplayName 'Alex Wilber'))
+            $good = @{ Users = $users; Mailboxes = @{ 'alex.wilber@contoso.com' = 'smtp:records@partner.example.com' }; Rules = @{}
+                Traces = @((Get-OfflineTrace -SenderAddress 'alex.wilber@contoso.com' -Recipient 'a@vendor.example.com')) }
+            $outputDir = Invoke-OfflineMonitorRun -Name 'folder-in-the-way' -Scenario $good -ExceptionTarget 'nobody@partner.example.com'
+            $countsPath = Join-Path $outputDir 'outbound-metadata-counts.json'
+            Remove-Item -LiteralPath $countsPath
+            New-Item -ItemType Directory -Path $countsPath | Out-Null
+            $before = Get-OutputSnapshot -Directory $outputDir
+
+            $thrown = $null
+            try { $null = Invoke-OfflineMonitorRun -Name 'folder-in-the-way' -Scenario @{ Users = $users; Mailboxes = @{}; Rules = @{}; Traces = @() } -ExceptionTarget 'nobody@partner.example.com' }
+            catch { $thrown = $_ }
+        }
+
+        It 'stops the run before any file changes, with a message that names the path' {
+            $thrown.Exception.Message | Should -BeLike '*outbound-metadata-counts.json*not a plain file*No output files were changed*'
+            Get-OutputSnapshot -Directory $outputDir | Should -BeExactly $before
+            Test-Path -LiteralPath $countsPath -PathType Container | Should -BeTrue
+        }
+    }
+
+    Context 'when the outbound baseline history is <Case>' -ForEach @(
+        @{ Case = 'cut off after its first record'; Folder = 'history-cut' }
+        @{ Case = 'empty'; Folder = 'history-empty' }
+    ) {
+        BeforeAll {
+            $users = @((Get-OfflineUser -Name 'alex.wilber' -DisplayName 'Alex Wilber'))
+            $first = @{ Users = $users; Mailboxes = @{}; Rules = @{}
+                Traces = @(
+                    (Get-OfflineTrace -SenderAddress 'alex.wilber@contoso.com' -Recipient 'a@vendor.example.com')
+                    (Get-OfflineTrace -SenderAddress 'sam.okafor@contoso.com' -Recipient 'b@vendor.example.com')
+                ) }
+            $outputDir = Invoke-OfflineMonitorRun -Name $Folder -Scenario $first -ExceptionTarget 'nobody@partner.example.com'
+            $historyPath = Join-Path $outputDir 'outbound-baseline-history.json'
+
+            # A cut right after a complete record is the dangerous kind: ConvertFrom-Json reads it without an error
+            # and returns the records before the cut, so a run that trusted it would write a shorter history back.
+            $full = [System.IO.File]::ReadAllText($historyPath)
+            $damaged = if ($Case -eq 'empty') { '' } else { $full.Substring(0, $full.IndexOf('},') + 2) }
+            [System.IO.File]::WriteAllText($historyPath, $damaged)
+
+            $second = @{ Users = $users; Mailboxes = @{ 'alex.wilber@contoso.com' = 'smtp:records@partner.example.com' }; Rules = @{}
+                Traces = @((Get-OfflineTrace -SenderAddress 'alex.wilber@contoso.com' -Recipient 'c@vendor.example.com')) }
+            $null = Invoke-OfflineMonitorRun -Name $Folder -Scenario $second -ExceptionTarget 'nobody@partner.example.com'
+        }
+
+        It 'leaves the history file exactly as it was instead of writing this run''s records over it' {
+            [System.IO.File]::ReadAllText($historyPath) | Should -BeExactly $damaged
+        }
+
+        It 'writes the reason to errors.log' {
+            Get-Content -LiteralPath (Join-Path $outputDir 'errors.log') -Raw | Should -BeLike '*Could not read outbound baseline history*left as it is*'
+        }
+
+        It 'still writes the other reports, with no temporary file or backup, and exits 0' {
+            $second.ExitCode | Should -Be 0
+            (Get-Content -LiteralPath (Join-Path $outputDir 'summary.json') -Raw | ConvertFrom-Json).UsersWithMailboxForwarding | Should -Be 1
+            $counts = @(Get-Content -LiteralPath (Join-Path $outputDir 'outbound-metadata-counts.json') -Raw | ConvertFrom-Json)
+            $counts.Count | Should -Be 1
+            $counts[0].BaselineSampleCount | Should -Be 0
+            @(Get-ChildItem -LiteralPath $outputDir -Force | Where-Object Name -match '\.(tmp|prev)$').Count | Should -Be 0
+        }
+    }
+
+    Context 'when another program holds the outbound baseline history open' {
+        BeforeAll {
+            $users = @((Get-OfflineUser -Name 'alex.wilber' -DisplayName 'Alex Wilber'))
+            $first = @{ Users = $users; Mailboxes = @{}; Rules = @{}
+                Traces = @((Get-OfflineTrace -SenderAddress 'alex.wilber@contoso.com' -Recipient 'a@vendor.example.com')) }
+            $outputDir = Invoke-OfflineMonitorRun -Name 'history-held' -Scenario $first -ExceptionTarget 'nobody@partner.example.com'
+            $historyPath = Join-Path $outputDir 'outbound-baseline-history.json'
+            $historyBefore = (Get-FileHash -LiteralPath $historyPath -Algorithm SHA256).Hash
+
+            $second = @{ Users = $users; Mailboxes = @{ 'alex.wilber@contoso.com' = 'smtp:records@partner.example.com' }; Rules = @{}
+                Traces = @((Get-OfflineTrace -SenderAddress 'alex.wilber@contoso.com' -Recipient 'c@vendor.example.com')) }
+            $holder = [System.IO.FileStream]::new($historyPath, 'Open', 'ReadWrite', 'None')
+            try { $null = Invoke-OfflineMonitorRun -Name 'history-held' -Scenario $second -ExceptionTarget 'nobody@partner.example.com' }
+            finally { $holder.Dispose() }
+        }
+
+        It 'leaves the history as it was, logs why, and still writes the other reports' {
+            (Get-FileHash -LiteralPath $historyPath -Algorithm SHA256).Hash | Should -BeExactly $historyBefore
+            Get-Content -LiteralPath (Join-Path $outputDir 'errors.log') -Raw | Should -BeLike '*Could not read outbound baseline history*'
+            $second.ExitCode | Should -Be 0
+            (Get-Content -LiteralPath (Join-Path $outputDir 'summary.json') -Raw | ConvertFrom-Json).UsersWithMailboxForwarding | Should -Be 1
+        }
+    }
+
+    Context 'when a user with a known forward cannot be read on a later run' {
+        BeforeAll {
+            $users = @(
+                (Get-OfflineUser -Name 'alice.ng' -DisplayName 'Alice Ng')
+                (Get-OfflineUser -Name 'bob.diaz' -DisplayName 'Bob Diaz')
+                (Get-OfflineUser -Name 'carol.otieno' -DisplayName 'Carol Otieno')
+            )
+            $traces = @((Get-OfflineTrace -SenderAddress 'bob.diaz@contoso.com' -Recipient 'a@vendor.example.com'))
+            $aliceRule = @{ 'alice.ng@contoso.com' = @((Get-OfflineRule -Name 'Copy invoices' -Target 'invoices@vendor.example.com')) }
+
+            # Run one: alice forwards her mailbox to a personal address (Critical) and has an inbox rule that forwards
+            # to a vendor (High). Carol forwards her mailbox to a partner.
+            $runOne = @{ Users = $users; Traces = $traces; Rules = $aliceRule
+                Mailboxes = @{ 'alice.ng@contoso.com' = 'smtp:alice.home@webmail.example.com'; 'carol.otieno@contoso.com' = 'smtp:records@partner.example.com' } }
+            $outputDir = Invoke-OfflineMonitorRun -Name 'carry-forward' -Scenario $runOne -ExceptionTarget 'nobody@partner.example.com'
+            $aliceOne = @(Get-Content -LiteralPath (Join-Path $outputDir 'forwarding-findings.json') -Raw | ConvertFrom-Json) |
+                Where-Object { $_.UserPrincipalName -eq 'alice.ng@contoso.com' -and $_.ForwardingType -eq 'MailboxForwarding' }
+
+            # Run two, twice: alice's mailbox cannot be read but her inbox rules can. Carol's mailbox read fails and
+            # Graph says she has no mailbox, so she is listed under UsersWithoutMailbox.
+            $runTwo = @{ Users = $users; Traces = $traces; Rules = $aliceRule; Mailboxes = @{}
+                MailboxErrors = @('alice.ng@contoso.com', 'carol.otieno@contoso.com'); RulesNoMailbox = @('carol.otieno@contoso.com') }
+            $null = Invoke-OfflineMonitorRun -Name 'carry-forward' -Scenario $runTwo -ExceptionTarget 'nobody@partner.example.com'
+            $findingsTwo = @(Get-Content -LiteralPath (Join-Path $outputDir 'forwarding-findings.json') -Raw | ConvertFrom-Json)
+            $csvTwo = @(Import-Csv -LiteralPath (Join-Path $outputDir 'forwarding-findings.csv'))
+            $summaryTwo = Get-Content -LiteralPath (Join-Path $outputDir 'summary.json') -Raw | ConvertFrom-Json
+            $htmlTwo = Get-Content -LiteralPath (Join-Path $outputDir 'dashboard.html') -Raw
+            $exitTwo = $runTwo.ExitCode
+
+            $null = Invoke-OfflineMonitorRun -Name 'carry-forward' -Scenario $runTwo -ExceptionTarget 'nobody@partner.example.com'
+            $findingsTwoAgain = @(Get-Content -LiteralPath (Join-Path $outputDir 'forwarding-findings.json') -Raw | ConvertFrom-Json)
+
+            # Run three: alice can be read again and no longer forwards anything.
+            $runThree = @{ Users = $users; Traces = $traces; Rules = @{}; Mailboxes = @{} }
+            $null = Invoke-OfflineMonitorRun -Name 'carry-forward' -Scenario $runThree -ExceptionTarget 'nobody@partner.example.com'
+            $findingsThree = @(Get-Content -LiteralPath (Join-Path $outputDir 'forwarding-findings.json') -Raw | ConvertFrom-Json)
+        }
+
+        It 'starts from a Critical mailbox forward for alice' {
+            $aliceOne.RiskLevel | Should -BeExactly 'Critical'
+            $aliceOne.NotRechecked | Should -BeFalse
+        }
+
+        It 'keeps alice''s mailbox forward when her mailbox cannot be read, marked not re-checked, with the first run''s DetectedAt' {
+            $exitTwo | Should -Be 2
+            $kept = @($findingsTwo | Where-Object { $_.UserPrincipalName -eq 'alice.ng@contoso.com' -and $_.ForwardingType -eq 'MailboxForwarding' })
+
+            $kept.Count | Should -Be 1
+            $kept[0].NotRechecked | Should -BeTrue
+            $kept[0].RiskLevel | Should -BeExactly 'Critical'
+            $kept[0].ForwardTarget | Should -BeExactly 'smtp:alice.home@webmail.example.com'
+            $kept[0].DetectedAt | Should -Be $aliceOne.DetectedAt
+        }
+
+        It 'reports alice''s inbox rule once, as read in this run, because the rules call worked' {
+            $rules = @($findingsTwo | Where-Object { $_.UserPrincipalName -eq 'alice.ng@contoso.com' -and $_.ForwardingType -eq 'InboxRuleForward' })
+
+            $rules.Count | Should -Be 1
+            $rules[0].NotRechecked | Should -BeFalse
+        }
+
+        It 'does not keep carol''s forward, because she is listed as having no mailbox' {
+            @($summaryTwo.UsersWithoutMailbox.UserPrincipalNames) | Should -Be @('carol.otieno@contoso.com')
+            @($summaryTwo.CollectionFailures.MailboxForwarding.UserPrincipalNames | Sort-Object) | Should -Be @('alice.ng@contoso.com', 'carol.otieno@contoso.com')
+            @($findingsTwo | Where-Object { $_.UserPrincipalName -eq 'carol.otieno@contoso.com' }).Count | Should -Be 0
+        }
+
+        It 'counts the kept forward in the summary' {
+            $summaryTwo.UsersWithMailboxForwarding | Should -Be 1
+            $summaryTwo.HighCriticalRiskCount | Should -Be 2
+        }
+
+        It 'carries the NotRechecked column in the findings CSV' {
+            $csvTwo[0].PSObject.Properties.Name | Should -Be $expectedFindingColumns
+            ($csvTwo | Where-Object ForwardingType -eq 'MailboxForwarding').NotRechecked | Should -BeExactly 'True'
+            ($csvTwo | Where-Object ForwardingType -eq 'InboxRuleForward').NotRechecked | Should -BeExactly 'False'
+        }
+
+        It 'marks the kept forward not re-checked in the risky users table of the dashboard' {
+            $rows = @([regex]::Matches($htmlTwo, '<tr><td>alice\.ng@contoso\.com</td>.*?</tr>') | ForEach-Object Value)
+
+            $rows.Count | Should -Be 2
+            @($rows | Where-Object { $_ -like '*webmail.example.com*' }) | Should -BeLike '*not re-checked*'
+            @($rows | Where-Object { $_ -like '*vendor.example.com*' }) | Should -Not -BeLike '*not re-checked*'
+        }
+
+        It 'keeps the first run''s DetectedAt when her mailbox fails again' {
+            $kept = @($findingsTwoAgain | Where-Object { $_.UserPrincipalName -eq 'alice.ng@contoso.com' -and $_.ForwardingType -eq 'MailboxForwarding' })
+
+            $kept.Count | Should -Be 1
+            $kept[0].NotRechecked | Should -BeTrue
+            $kept[0].DetectedAt | Should -Be $aliceOne.DetectedAt
+        }
+
+        It 'drops the forward once her mailbox is read again and has none' {
+            $runThree.ExitCode | Should -Be 0
+            @($findingsThree | Where-Object { $_.UserPrincipalName -eq 'alice.ng@contoso.com' }).Count | Should -Be 0
+        }
+    }
+
+    Context 'when two scans run one after the other in the same folder' {
+        BeforeAll {
+            $scenario = @{ Users = @((Get-OfflineUser -Name 'alex.wilber' -DisplayName 'Alex Wilber')); Mailboxes = @{}; Rules = @{}
+                Traces = @((Get-OfflineTrace -SenderAddress 'alex.wilber@contoso.com' -Recipient 'a@vendor.example.com')) }
+            $outputDir = Invoke-OfflineMonitorRun -Name 'back-to-back' -Scenario $scenario -ExceptionTarget 'nobody@partner.example.com'
+            $firstExit = $scenario.ExitCode
+            $lockAfterFirst = [System.IO.File]::Exists((Join-Path $outputDir '.scan.lock'))
+            $null = Invoke-OfflineMonitorRun -Name 'back-to-back' -Scenario $scenario -ExceptionTarget 'nobody@partner.example.com'
+        }
+
+        It 'runs both to the end and removes the lock after each' {
+            $firstExit | Should -Be 0
+            $lockAfterFirst | Should -BeFalse
+            $scenario.ExitCode | Should -Be 0
+            Join-Path $outputDir '.scan.lock' | Should -Not -Exist
+            @(Get-Content -LiteralPath (Join-Path $outputDir 'outbound-baseline-history.json') -Raw | ConvertFrom-Json).Count | Should -Be 2
+        }
+    }
+
+    Context 'when the output folder holds a lock from a scan that started seven hours ago' {
+        BeforeAll {
+            $scenario = @{ Users = @((Get-OfflineUser -Name 'alex.wilber' -DisplayName 'Alex Wilber')); Mailboxes = @{}; Rules = @{}
+                Traces = @((Get-OfflineTrace -SenderAddress 'alex.wilber@contoso.com' -Recipient 'a@vendor.example.com')) }
+            $seed = {
+                param($Dir)
+                $started = [datetime]::UtcNow.AddHours(-7).ToString('o', [cultureinfo]::InvariantCulture)
+                [System.IO.File]::WriteAllText((Join-Path $Dir '.scan.lock'), "ProcessId: 4242`nStartedAt: $started`n")
+            }
+            $outputDir = Invoke-OfflineMonitorRun -Name 'stale-lock' -Scenario $scenario -ExceptionTarget 'nobody@partner.example.com' -Seed $seed
+        }
+
+        It 'takes the lock over, completes the scan and says so in errors.log' {
+            $scenario.ExitCode | Should -Be 0
+            Join-Path $outputDir 'dashboard.html' | Should -Exist
+            Get-Content -LiteralPath (Join-Path $outputDir 'errors.log') -Raw | Should -BeLike '*Took over the scan lock*process 4242*'
+            Join-Path $outputDir '.scan.lock' | Should -Not -Exist
+        }
+    }
+
+    Context 'when another scan is running in the output folder' {
+        BeforeAll {
+            $users = @((Get-OfflineUser -Name 'alex.wilber' -DisplayName 'Alex Wilber'))
+            $good = @{ Users = $users; Mailboxes = @{ 'alex.wilber@contoso.com' = 'smtp:records@partner.example.com' }; Rules = @{}
+                Traces = @((Get-OfflineTrace -SenderAddress 'alex.wilber@contoso.com' -Recipient 'a@vendor.example.com')) }
+            $outputDir = Invoke-OfflineMonitorRun -Name 'busy' -Scenario $good -ExceptionTarget 'nobody@partner.example.com'
+
+            $started = [datetime]::UtcNow.AddMinutes(-5)
+            $startedText = $started.ToString('yyyy-MM-ddTHH:mm:ssZ', [cultureinfo]::InvariantCulture)
+            [System.IO.File]::WriteAllText((Join-Path $outputDir '.scan.lock'), "ProcessId: 4242`nStartedAt: $($started.ToString('o', [cultureinfo]::InvariantCulture))`n")
+            $before = Get-OutputSnapshot -Directory $outputDir
+
+            $second = @{ Users = $users; Mailboxes = @{}; Rules = @{}; Traces = @() }
+            $thrown = $null
+            try { $null = Invoke-OfflineMonitorRun -Name 'busy' -Scenario $second -ExceptionTarget 'nobody@partner.example.com' }
+            catch { $thrown = $_ }
+            $after = Get-OutputSnapshot -Directory $outputDir
+
+            # The same stop from a separate process, to see the exit code a scheduler gets.
+            $runRoot = Join-Path $TestDrive 'busy'
+            $childOutput = & ([System.Environment]::ProcessPath) -NoProfile -NonInteractive -File $monitorScript `
+                -SettingsPath (Join-Path $runRoot 'settings.json') -ApprovedExceptionsPath (Join-Path $runRoot 'exceptions.csv') -SkipConnect 2>&1
+            $childExit = $LASTEXITCODE
+        }
+
+        It 'stops before it asks Microsoft for anything, with a message that names the folder and when the other scan started' {
+            $thrown | Should -Not -BeNullOrEmpty
+            $thrown.Exception.Message.StartsWith("Another scan is running in $outputDir (started $startedText)") | Should -BeTrue
+            [int]$second.GraphCalls | Should -Be 0
+        }
+
+        It 'leaves the other scan''s lock and every output file as they were' {
+            $after | Should -BeExactly $before
+        }
+
+        It 'exits with code 1 when run as its own process' {
+            $childExit | Should -Be 1
+            ($childOutput | Out-String) | Should -BeLike '*Another scan is running in*'
+        }
+    }
+}
+
+Describe 'Putting the staged output files in place' {
+    BeforeAll {
+        $monitorScript = Join-Path (Join-Path $PSScriptRoot '..') 'src/Invoke-ForwardingMonitor.ps1'
+        foreach ($functionName in 'Remove-M365File', 'New-M365RunId', 'Add-M365StagedFile', 'Publish-M365StagedFile', 'Clear-M365StagedFile', 'Repair-M365OutputFolder') {
+            . ([scriptblock]::Create((Get-FunctionTextFromFile -Path $monitorScript -Name $functionName)))
+        }
+
+        # The eight files a run writes, in the order the script stages them.
+        $leaves = @('forwarding-findings.json', 'outbound-metadata-counts.json', 'summary.json', 'forwarding-findings.csv',
+            'outbound-metadata-counts.csv', 'summary.csv', 'outbound-baseline-history.json', 'dashboard.html')
+
+        function New-TestFolder {
+            param([string]$Name, [switch]$Empty)
+            $folder = Join-Path $TestDrive $Name
+            New-Item -ItemType Directory -Path $folder -Force | Out-Null
+            if (-not $Empty) {
+                foreach ($leaf in $leaves) { [System.IO.File]::WriteAllText((Join-Path $folder $leaf), "previous run: $leaf") }
+            }
+            return $folder
+        }
+
+        function New-TestStagedSet {
+            param([string]$Folder, [string]$Version = 'this run')
+            $runId = New-M365RunId -StartedUtc ([datetime]::UtcNow)
+            $staged = [System.Collections.Generic.List[object]]::new()
+            foreach ($leaf in $leaves) {
+                $content = "${Version}: $leaf"
+                Add-M365StagedFile -Staged $staged -RunId $runId -Path (Join-Path $Folder $leaf) -Write ({ param($TempPath) [System.IO.File]::WriteAllText($TempPath, $content) }.GetNewClosure())
+            }
+            return , $staged
+        }
+
+        function Get-FolderState {
+            param([string]$Folder)
+            # Every entry, hidden ones included: a file by the SHA-256 of its bytes, a folder by its name alone.
+            $state = [ordered]@{}
+            foreach ($entry in Get-ChildItem -LiteralPath $Folder -Force | Sort-Object Name) {
+                $state[$entry.Name] = if ($entry.PSIsContainer) { 'folder' } else { (Get-FileHash -LiteralPath $entry.FullName -Algorithm SHA256).Hash }
+            }
+            return ($state | ConvertTo-Json -Compress)
+        }
+    }
+
+    It 'replaces every file in the order staged, dashboard last, and leaves no temporary file or backup' {
+        $folder = New-TestFolder -Name 'in-order'
+        $staged = New-TestStagedSet -Folder $folder
+
+        $messages = @(Publish-M365StagedFile -Staged $staged -Verbose 4>&1 | ForEach-Object { $_.Message })
+
+        $messages | Should -Be @($leaves | ForEach-Object { "Put $_ in place." })
+        foreach ($leaf in $leaves) {
+            [System.IO.File]::ReadAllText((Join-Path $folder $leaf)) | Should -BeExactly "this run: $leaf"
+        }
+        @(Get-ChildItem -LiteralPath $folder -Force).Count | Should -Be 8
+    }
+
+    It 'stops before any file changes when a folder sits at file <Position> of 8' -ForEach @(
+        @{ Position = 2 }
+        @{ Position = 5 }
+        @{ Position = 8 }
+    ) {
+        $folder = New-TestFolder -Name "folder-at-$Position"
+        $leaf = $leaves[$Position - 1]
+        Remove-Item -LiteralPath (Join-Path $folder $leaf)
+        New-Item -ItemType Directory -Path (Join-Path $folder $leaf) | Out-Null
+        $before = Get-FolderState -Folder $folder
+        $staged = New-TestStagedSet -Folder $folder
+
+        { Publish-M365StagedFile -Staged $staged } | Should -Throw "*$leaf*not a plain file*No output files were changed*"
+        Get-FolderState -Folder $folder | Should -BeExactly $before
+    }
+
+    It 'stops before any file changes when a link to a folder sits where dashboard.html goes' {
+        $folder = New-TestFolder -Name 'link-in-the-way'
+        $elsewhere = Join-Path $TestDrive 'link-target'
+        New-Item -ItemType Directory -Path $elsewhere -Force | Out-Null
+        Remove-Item -LiteralPath (Join-Path $folder 'dashboard.html')
+        New-Item -ItemType SymbolicLink -Path (Join-Path $folder 'dashboard.html') -Target $elsewhere | Out-Null
+        $before = Get-FolderState -Folder $folder
+        $staged = New-TestStagedSet -Folder $folder
+
+        { Publish-M365StagedFile -Staged $staged } | Should -Throw '*dashboard.html*not a plain file*'
+        Get-FolderState -Folder $folder | Should -BeExactly $before
+        @(Get-ChildItem -LiteralPath $elsewhere -Force).Count | Should -Be 0
+    }
+
+    It 'puts back every file already replaced when the swap of file <Position> of 8 fails' -ForEach @(
+        @{ Position = 2 }
+        @{ Position = 5 }
+        @{ Position = 8 }
+    ) {
+        $folder = New-TestFolder -Name "swap-fails-at-$Position"
+        $before = Get-FolderState -Folder $folder
+        $staged = New-TestStagedSet -Folder $folder
+        # The temporary file of this one vanishes after staging, so its swap fails after the ones before it were made.
+        Remove-Item -LiteralPath $staged[$Position - 1].TempPath -Force
+
+        $thrown = $null
+        try { Publish-M365StagedFile -Staged $staged } catch { $thrown = $_ }
+
+        $thrown.Exception.Message | Should -BeLike "Could not put *$($leaves[$Position - 1]) in place.*The previous run's files were put back*"
+        Get-FolderState -Folder $folder | Should -BeExactly $before
+    }
+
+    It 'removes again a file it created where there was none when a later swap fails' {
+        $folder = New-TestFolder -Name 'first-run-fails' -Empty
+        $staged = New-TestStagedSet -Folder $folder
+        Remove-Item -LiteralPath $staged[4].TempPath -Force
+
+        { Publish-M365StagedFile -Staged $staged } | Should -Throw "*$($leaves[4]) in place*The previous run's files were put back*"
+        @(Get-ChildItem -LiteralPath $folder -Force).Count | Should -Be 0
+    }
+
+    It 'never lets a file go missing while it is replaced' {
+        $folder = New-TestFolder -Name 'watched'
+        $paths = [string[]]@($leaves | ForEach-Object { Join-Path $folder $_ })
+        $watch = [hashtable]::Synchronized(@{ Stop = $false; Checks = 0; Missing = 0 })
+        $poller = [powershell]::Create()
+        $null = $poller.AddScript({
+                param($Paths, $Watch)
+                while (-not $Watch.Stop) {
+                    foreach ($path in $Paths) {
+                        $Watch.Checks++
+                        if (-not [System.IO.File]::Exists($path)) { $Watch.Missing++ }
+                    }
+                }
+            }).AddArgument($paths).AddArgument($watch)
+        $handle = $poller.BeginInvoke()
+        try {
+            $deadline = [datetime]::UtcNow.AddSeconds(30)
+            while ($watch.Checks -eq 0 -and [datetime]::UtcNow -lt $deadline) { [System.Threading.Thread]::Sleep(1) }
+            for ($round = 1; $round -le 100; $round++) {
+                Publish-M365StagedFile -Staged (New-TestStagedSet -Folder $folder -Version "round $round")
+            }
+        }
+        finally {
+            $watch.Stop = $true
+            $null = $poller.EndInvoke($handle)
+            $poller.Dispose()
+        }
+
+        $watch.Checks | Should -BeGreaterThan 0
+        $watch.Missing | Should -Be 0
+    }
+
+    It 'cleans up after an interrupted run: puts back a backup whose file is missing, removes the other leftovers and leaves the rest alone' {
+        $folder = New-TestFolder -Name 'interrupted'
+        $runStartedUtc = [datetime]::UtcNow
+        $thisRun = New-M365RunId -StartedUtc $runStartedUtc
+        $earlier = New-M365RunId -StartedUtc $runStartedUtc.AddMinutes(-30)
+        $later = New-M365RunId -StartedUtc $runStartedUtc.AddMinutes(5)
+        $olderVersionTemp = '.summary.csv.0123456789abcdef0123456789abcdef.tmp'
+        Remove-Item -LiteralPath (Join-Path $folder 'summary.json')
+        $files = [ordered]@{
+            ".summary.json.$earlier.prev"   = 'summary from the run before'
+            ".dashboard.html.$earlier.prev" = 'dashboard from the run before'
+            ".summary.csv.$earlier.tmp"     = 'half written'
+            $olderVersionTemp               = 'left by an older version'
+            ".dashboard.html.$thisRun.tmp"  = 'this run'
+            ".dashboard.html.$later.tmp"    = 'a run that started later'
+            '.scan.lock'                    = 'ProcessId: 4242'
+            'notes.tmp'                     = 'not written by the scan'
+        }
+        foreach ($name in $files.Keys) { [System.IO.File]::WriteAllText((Join-Path $folder $name), $files[$name]) }
+        [System.IO.File]::SetLastWriteTimeUtc((Join-Path $folder $olderVersionTemp), $runStartedUtc.AddHours(-2))
+
+        $result = Repair-M365OutputFolder -OutputPath $folder -RunId $thisRun -RunStartedUtc $runStartedUtc
+
+        [System.IO.File]::ReadAllText((Join-Path $folder 'summary.json')) | Should -BeExactly 'summary from the run before'
+        [System.IO.File]::ReadAllText((Join-Path $folder 'dashboard.html')) | Should -BeExactly 'previous run: dashboard.html'
+        @($result.Restored) | Should -Be @(".summary.json.$earlier.prev")
+        @($result.Removed | Sort-Object) | Should -Be @(@(".dashboard.html.$earlier.prev", ".summary.csv.$earlier.tmp", $olderVersionTemp) | Sort-Object)
+        foreach ($name in ".dashboard.html.$thisRun.tmp", ".dashboard.html.$later.tmp", '.scan.lock', 'notes.tmp') {
+            Join-Path $folder $name | Should -Exist
+        }
+        $log = Get-Content -LiteralPath (Join-Path $folder 'errors.log') -Raw
+        $log | Should -BeLike "*put back summary.json from .summary.json.$earlier.prev*"
+        $log | Should -BeLike '*removed 3 leftover file(s)*'
+    }
+}
+
+Describe 'Putting files in place while the writer is killed at random moments' {
+    BeforeAll {
+        $monitorScript = Join-Path (Join-Path $PSScriptRoot '..') 'src/Invoke-ForwardingMonitor.ps1'
+        foreach ($functionName in 'Remove-M365File', 'New-M365RunId', 'Repair-M365OutputFolder') {
+            . ([scriptblock]::Create((Get-FunctionTextFromFile -Path $monitorScript -Name $functionName)))
+        }
+
+        $leaves = @('forwarding-findings.json', 'outbound-metadata-counts.json', 'summary.json', 'forwarding-findings.csv',
+            'outbound-metadata-counts.csv', 'summary.csv', 'outbound-baseline-history.json', 'dashboard.html')
+        $outputDir = Join-Path $TestDrive 'killed'
+        New-Item -ItemType Directory -Path $outputDir | Out-Null
+        $padding = 'x' * 65536
+        $expected = @{}
+        foreach ($leaf in $leaves) {
+            $expected[$leaf] = @("$leaf version A`n$padding", "$leaf version B`n$padding")
+            [System.IO.File]::WriteAllText((Join-Path $outputDir $leaf), $expected[$leaf][0])
+        }
+
+        # The child loads the real Add-M365StagedFile and Publish-M365StagedFile from the script and puts version B,
+        # then A, then B again in place, as fast as it can, until it is killed.
+        $childScript = Join-Path $TestDrive 'publish-until-killed.ps1'
+        Set-Content -LiteralPath $childScript -Encoding UTF8 -Value @'
+param([string]$MonitorScript, [string]$OutputDir, [string]$ReadyPath)
+$ErrorActionPreference = 'Stop'
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($MonitorScript, [ref]$null, [ref]$null)
+foreach ($name in 'Remove-M365File', 'New-M365RunId', 'Add-M365StagedFile', 'Publish-M365StagedFile') {
+    $definition = $ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name }, $true)
+    . ([scriptblock]::Create($definition.Extent.Text))
+}
+$leaves = @('forwarding-findings.json', 'outbound-metadata-counts.json', 'summary.json', 'forwarding-findings.csv',
+    'outbound-metadata-counts.csv', 'summary.csv', 'outbound-baseline-history.json', 'dashboard.html')
+$padding = 'x' * 65536
+[System.IO.File]::WriteAllText($ReadyPath, 'ready')
+for ($round = 1; $true; $round++) {
+    $version = if ($round % 2) { 'B' } else { 'A' }
+    $runId = New-M365RunId -StartedUtc ([datetime]::UtcNow)
+    $staged = [System.Collections.Generic.List[object]]::new()
+    foreach ($leaf in $leaves) {
+        $content = "$leaf version $version`n$padding"
+        Add-M365StagedFile -Staged $staged -RunId $runId -Path (Join-Path $OutputDir $leaf) -Write ({ param($TempPath) [System.IO.File]::WriteAllText($TempPath, $content) }.GetNewClosure())
+    }
+    Publish-M365StagedFile -Staged $staged
+}
+'@
+
+        $kills = 0
+        $interrupted = 0
+        $duringSwap = 0
+        $losses = 0
+        $remaining = 0
+        $childFailures = [System.Collections.Generic.List[string]]::new()
+        for ($attempt = 1; $attempt -le 60; $attempt++) {
+            $ready = Join-Path $TestDrive "ready-$attempt"
+            $startInfo = [System.Diagnostics.ProcessStartInfo]::new([System.Environment]::ProcessPath)
+            foreach ($argument in '-NoProfile', '-NonInteractive', '-File', $childScript, $monitorScript, $outputDir, $ready) { $startInfo.ArgumentList.Add($argument) }
+            $startInfo.UseShellExecute = $false
+            $startInfo.RedirectStandardOutput = $true
+            $startInfo.RedirectStandardError = $true
+            $child = [System.Diagnostics.Process]::Start($startInfo)
+            $deadline = [datetime]::UtcNow.AddSeconds(60)
+            while (-not [System.IO.File]::Exists($ready) -and -not $child.HasExited -and [datetime]::UtcNow -lt $deadline) {
+                [System.Threading.Thread]::Sleep(5)
+            }
+            [System.Threading.Thread]::Sleep((Get-Random -Minimum 0 -Maximum 250))
+            if ($child.HasExited) {
+                $childFailures.Add($child.StandardError.ReadToEnd())
+            }
+            else {
+                $child.Kill()
+                $kills++
+            }
+            $child.WaitForExit()
+            $child.Dispose()
+
+            # What the next scan would find, then what it leaves after its cleanup. A backup is there only while
+            # Publish-M365StagedFile is swapping files, so a kill that left one landed in the middle of the swaps.
+            $leftBehind = @(Get-ChildItem -LiteralPath $outputDir -Force -File | Where-Object Name -match '\.(tmp|prev)$')
+            if ($leftBehind.Count -gt 0) { $interrupted++ }
+            if (@($leftBehind | Where-Object Name -like '*.prev').Count -gt 0) { $duringSwap++ }
+            $now = [datetime]::UtcNow
+            $null = Repair-M365OutputFolder -OutputPath $outputDir -RunId (New-M365RunId -StartedUtc $now) -RunStartedUtc $now
+            foreach ($leaf in $leaves) {
+                $path = Join-Path $outputDir $leaf
+                if (-not [System.IO.File]::Exists($path) -or [System.IO.File]::ReadAllText($path) -cnotin $expected[$leaf]) { $losses++ }
+            }
+            $remaining += @(Get-ChildItem -LiteralPath $outputDir -Force -File | Where-Object Name -match '\.(tmp|prev)$').Count
+        }
+        Write-Host "Kill test: $kills kills, $interrupted left temporary files or backups behind ($duringSwap in the middle of the swaps), $losses files lost or damaged, $remaining leftovers after cleanup."
+    }
+
+    It 'killed the writer 60 times while it was writing, some of them in the middle of the swaps' {
+        $childFailures.Count | Should -Be 0 -Because ($childFailures -join [Environment]::NewLine)
+        $kills | Should -Be 60
+        $interrupted | Should -BeGreaterThan 0
+        $duringSwap | Should -BeGreaterThan 0
+    }
+
+    It 'lost no file: after each kill and cleanup every file is there and whole, with its old or its new content' {
+        $losses | Should -Be 0
+    }
+
+    It 'left no temporary file or backup after each cleanup' {
+        $remaining | Should -Be 0
     }
 }
