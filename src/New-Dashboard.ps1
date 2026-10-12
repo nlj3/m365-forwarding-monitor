@@ -34,7 +34,7 @@ function Get-M365DashboardNoMailboxHtml {
 }
 
 function Get-M365DashboardWarningHtml {
-    param([Parameter(Mandatory)][object]$Summary)
+    param([Parameter(Mandatory)][object]$Summary, [Parameter()][int]$KeptCount = 0)
 
     # A scan that could not see everything must say so at the top of the page.
     # Older summaries have no failure fields, so a missing field counts as nothing to report.
@@ -68,7 +68,9 @@ function Get-M365DashboardWarningHtml {
     if ($lines.Count -eq 0) { return "" }
 
     $items = ($lines | ForEach-Object { "<li>$_</li>" }) -join "`n        "
-    $keptNote = if ($hasUnreadUsers) { "Forwards that an earlier scan found for these users are still listed, marked not re-checked. " } else { "" }
+    # Only when forwards were in fact kept this run. With the previous report unreadable, nothing could be kept.
+    $previousUnreadable = $Summary.PSObject.Properties.Name -contains "PreviousReportUnreadable" -and $Summary.PreviousReportUnreadable -eq $true
+    $keptNote = if ($hasUnreadUsers -and $KeptCount -gt 0 -and -not $previousUnreadable) { "Forwards that an earlier scan found for these users are still listed, marked not re-checked. " } else { "" }
     return @"
 <section class="warning" role="alert">
       <strong>Incomplete scan.</strong> This run could not read everything it covers.
@@ -107,7 +109,8 @@ function New-M365ForwardingDashboard {
     }
 
     $dashboardPath = if ([string]::IsNullOrWhiteSpace($FilePath)) { Join-Path $OutputPath "dashboard.html" } else { $FilePath }
-    $warningHtml = Get-M365DashboardWarningHtml -Summary $Summary
+    $keptCount = @($ForwardingFindings | Where-Object { $_.PSObject.Properties.Name -contains "NotRechecked" -and $_.NotRechecked -eq $true }).Count
+    $warningHtml = Get-M365DashboardWarningHtml -Summary $Summary -KeptCount $keptCount
     $noMailboxHtml = Get-M365DashboardNoMailboxHtml -Summary $Summary
     $generatedAt = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss zzz")
 

@@ -36,10 +36,11 @@ function Get-M365MessageRuleForwarding {
 
         # Rules that cannot be read are counted, never skipped silently: a scan that cannot see must not look clean.
         try {
-            # The user name is encoded for the URL: a guest member's name holds #EXT#, and an unencoded # would end
-            # the path there and start a fragment.
+            # Inbox rules are read by the user's object id, so no user name goes into the URL: a guest member's name
+            # holds #EXT#, and a # would end the path there. The value is still encoded, as every value in a URL is.
+            $userKey = if ([string]::IsNullOrWhiteSpace([string]$user.Id)) { $upn } else { [string]$user.Id }
             $rules = Invoke-M365CallWithRetry -OperationName "Graph messageRules $upn" -OutputPath $OutputPath -ThrowOnFailure -NoRetryWhen { param($ErrorRecord) Test-M365NoMailboxError -ErrorRecord $ErrorRecord -Source InboxRules } -ScriptBlock {
-                Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/users/$([System.Uri]::EscapeDataString($upn))/mailFolders/inbox/messageRules" -ErrorAction Stop
+                Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/users/$([System.Uri]::EscapeDataString($userKey))/mailFolders/inbox/messageRules" -ErrorAction Stop
             }
         }
         catch {

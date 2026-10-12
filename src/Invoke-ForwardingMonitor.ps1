@@ -12,9 +12,10 @@ run. A mailbox or inbox that cannot be read is counted and named in summary.json
 user could be read in a collector the run stops. An account that has no mailbox is not a failure; it is listed
 under UsersWithoutMailbox and named on the dashboard. "No mailbox" is not taken on trust: when one collector says
 it but the other read that mailbox in the same run, or the last report has forwards for that account that were read
-in that run, it counts as a failed read; and when a collector says it for every user, the run stops rather than
-publish an empty report. A mailbox that is removed therefore costs one partial run with its forwards kept; on the
-run after that the account is listed as having no mailbox and its forwards are dropped, with a line in errors.log.
+in that run or kept because a read failed, it counts as a failed read; and when a collector says it for every user,
+the run stops rather than publish an empty report. Each kept forward records why in KeptBecause (Failed or
+NoMailbox). A mailbox that is removed therefore costs one partial run with its forwards kept; when the account says
+it has no mailbox again, it is listed under UsersWithoutMailbox and its forwards are dropped, with a line in errors.log.
 For a user whose reads failed, the forwards found by the last scan are kept in the report, scored again with the
 current settings and exceptions, and marked NotRechecked, so a known forward does not drop off because of one bad
 read. A baseline history that cannot be read is left as it is and the run is reported as degraded
@@ -25,9 +26,10 @@ The report files are written to hidden temporary files, flushed to the disk, and
 one, each with an atomic replace, dashboard last. If a swap fails, the files already swapped are put back, so the
 output folder holds either the previous run or this one. What an interrupted run left behind is cleaned up at the
 start of the next one. Only one scan runs in an output folder at a time: the scan holds output/.scan.lock while it
-runs. A lock left on this computer by a process that is no longer running is taken over at once, and a lock whose
-scan is still running on this computer is respected however old it is. Any other lock (from another computer, or
-naming a running process that cannot be shown to be the scan that wrote it) is taken over after six hours.
+runs. The scan keeps that file open with no sharing, and the operating system lets go of it when the process ends
+in any way, a kill included: a second scan that finds it held stops, and a lock that nobody holds is taken at once.
+Only a lock file that cannot be opened for another reason, such as its permissions, is judged by its age, and
+replaced once it is more than six hours old.
 
 .PARAMETER SettingsPath
 Path to settings.json. A relative path is read from the folder this script is in.
@@ -269,19 +271,23 @@ function Test-M365TransientFileError {
         [System.Management.Automation.ErrorRecord]$ErrorRecord
     )
 
-    # True only for a sharing violation: another program holds the file for a moment, and waiting can clear it.
-    # Windows reports ERROR_SHARING_VIOLATION (0x80070020) or ERROR_LOCK_VIOLATION (0x80070021). Linux and macOS
-    # report EBUSY (16) or ETXTBSY (26), which .NET passes on as the HResult and as a message that says busy.
-    # Access denied, and a path, folder, drive or file that is not there, are not retried: waiting does not fix them.
+    # True only for a file another program holds for a moment, so that waiting can clear it. The error code decides,
+    # never the message: messages are translated, and a path can hold any word.
+    #   Windows: ERROR_SHARING_VIOLATION (0x80070020), ERROR_LOCK_VIOLATION (0x80070021), and access denied
+    #            (0x80070005), which an indexer, OneDrive or the preview pane causes while it holds a file briefly.
+    #   Linux and macOS: EBUSY (16) or ETXTBSY (26), which .NET passes on as the HResult.
+    # A path, folder, drive or file that is not there is never tried again.
     for ($exception = $ErrorRecord.Exception; $null -ne $exception; $exception = $exception.InnerException) {
         if ($exception -is [System.IO.FileNotFoundException] -or $exception -is [System.IO.DirectoryNotFoundException] -or
             $exception -is [System.IO.PathTooLongException] -or $exception -is [System.IO.DriveNotFoundException]) {
             return $false
         }
+        $code = $exception.HResult
+        if ($exception -is [System.UnauthorizedAccessException]) {
+            return ($IsWindows -and $code -eq -2147024891)
+        }
         if ($exception -is [System.IO.IOException]) {
-            $sharingViolation = $exception.HResult -eq -2147024864 -or $exception.HResult -eq -2147024863
-            $busy = $exception.HResult -eq 16 -or $exception.HResult -eq 26 -or $exception.Message -match "busy"
-            return ($sharingViolation -or $busy)
+            return ($code -eq -2147024864 -or $code -eq -2147024863 -or $code -eq 16 -or $code -eq 26 -or ($IsWindows -and $code -eq -2147024891))
         }
     }
     return $false
@@ -635,94 +641,43 @@ function Repair-M365OutputFolder {
     return [pscustomobject]@{ Restored = @($restored); Removed = @($removed) }
 }
 
-function Read-M365ScanLock {
-    [CmdletBinding()]
+function Test-M365LockConflict {
     param(
         [Parameter(Mandatory)]
-        [string]$Path
+        [System.Management.Automation.ErrorRecord]$ErrorRecord
     )
 
-    # Returns what a scan lock says, or $null when there is no lock file. A start time that cannot be read is taken
-    # from the time the file was last written, so a lock left empty by a scan that stopped at the wrong moment
-    # still ages out.
-    if (-not [System.IO.File]::Exists($Path)) {
-        return $null
-    }
-
-    $text = ""
-    try {
-        $stream = [System.IO.FileStream]::new($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]"ReadWrite, Delete")
-        try {
-            $text = [System.IO.StreamReader]::new($stream).ReadToEnd()
-        }
-        finally {
-            $stream.Dispose()
+    # True when opening the scan lock failed because another process holds it open: on Windows a sharing or lock
+    # violation, on Linux and macOS the lock .NET takes on a file opened with no sharing (EWOULDBLOCK, which is 11 on
+    # Linux and 35 on macOS). Any other failure, such as access denied, is not a held lock.
+    for ($exception = $ErrorRecord.Exception; $null -ne $exception; $exception = $exception.InnerException) {
+        if ($exception -is [System.IO.IOException] -and $exception -isnot [System.IO.FileNotFoundException] -and $exception -isnot [System.IO.DirectoryNotFoundException]) {
+            $code = $exception.HResult
+            if ($code -eq -2147024864 -or $code -eq -2147024863) {
+                return $true
+            }
+            if (-not $IsWindows -and ($code -eq 11 -or $code -eq 35)) {
+                return $true
+            }
         }
     }
-    catch {
-        if (-not [System.IO.File]::Exists($Path)) {
-            return $null
-        }
-    }
-
-    $parsed = [datetimeoffset]::MinValue
-    $startedUtc = [System.IO.File]::GetLastWriteTimeUtc($Path)
-    if ($text -match '(?m)^StartedAt:\s*(\S+)' -and
-        [datetimeoffset]::TryParse($Matches[1], [cultureinfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$parsed)) {
-        $startedUtc = $parsed.UtcDateTime
-    }
-    $processStartedUtc = $null
-    if ($text -match '(?m)^ProcessStartedAt:\s*(\S+)' -and
-        [datetimeoffset]::TryParse($Matches[1], [cultureinfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$parsed)) {
-        $processStartedUtc = $parsed.UtcDateTime
-    }
-    $processId = if ($text -match '(?m)^ProcessId:\s*(\d+)') { $Matches[1] } else { "unknown" }
-    $machineName = if ($text -match '(?m)^MachineName:[ \t]*(\S.*?)[ \t]*$') { $Matches[1] } else { "" }
-
-    return [pscustomobject]@{
-        Text              = $text
-        StartedUtc        = $startedUtc
-        ProcessId         = $processId
-        ProcessStartedUtc = $processStartedUtc
-        MachineName       = $machineName
-    }
+    return $false
 }
 
-function Get-M365ScanLockHolderState {
-    [CmdletBinding()]
+function ConvertFrom-M365ScanLockText {
     param(
-        [Parameter(Mandatory)]
-        [int]$ProcessId,
-
         [Parameter()]
-        [AllowNull()]
-        [Nullable[datetime]]$ProcessStartedUtc
+        [AllowEmptyString()]
+        [string]$Text = ""
     )
 
-    # What can be told about the process that wrote a lock on this computer:
-    #   Gone     no process has that id, so the scan that wrote the lock has ended.
-    #   Running  a process has that id and the start time in the lock matches it: that scan is still running.
-    #   Unknown  a process has that id, but its start time cannot be read, is not in the lock, or does not match.
-    #            Ids are reused, and in a container the scan is process 1 every run, so this cannot say which.
-    $process = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
-    if ($null -eq $process) {
-        return "Gone"
-    }
-    if ($null -eq $ProcessStartedUtc) {
-        return "Unknown"
-    }
-    try {
-        $actualUtc = $process.StartTime.ToUniversalTime()
-    }
-    catch {
-        return "Unknown"
-    }
-    # PowerShell hands a [Nullable[datetime]] parameter over as a plain date, so it is cast, not read through .Value.
-    if ([Math]::Abs(($actualUtc - [datetime]$ProcessStartedUtc).TotalSeconds) -lt 1) {
-        return "Running"
-    }
-    return "Unknown"
+    # What a scan wrote into the lock, for people to read: its process id, its computer and when it started.
+    $processId = if ($Text -match '(?m)^ProcessId:\s*(\d+)') { $Matches[1] } else { "unknown" }
+    $machineName = if ($Text -match '(?m)^MachineName:[ \t]*(\S.*?)[ \t]*$') { $Matches[1] } else { "an unknown computer" }
+    $startedAt = if ($Text -match '(?m)^StartedAt:\s*(\S+)') { $Matches[1] } else { "an unknown time" }
+    return [pscustomobject]@{ ProcessId = $processId; MachineName = $machineName; StartedAt = $startedAt }
 }
+
 
 function Enter-M365ScanLock {
     [CmdletBinding()]
@@ -734,103 +689,70 @@ function Enter-M365ScanLock {
         [datetime]$StartedUtc
     )
 
-    # One scan per output folder. The lock file is created only when it does not exist yet. It holds this scan's
-    # process id, the time that process started, the computer name and the UTC start time of the scan, and it stays
-    # open until Exit-M365ScanLock.
-    #
-    # When a lock is already there:
-    #   - written on this computer by a process that is no longer running: taken over at once.
-    #   - written on this computer by the same process, still running (its start time matches): respected, however old.
-    #   - anything else (another computer, or a running process that cannot be shown to be the one that wrote the
-    #     lock): respected for six hours from the scan's start, then taken over.
-    # Each takeover is written to errors.log.
+    # One scan per output folder. The scan opens output/.scan.lock with no sharing and keeps it open until the end.
+    # The operating system holds that lock for it and lets go when the process ends in any way, a kill included, so a
+    # lock that nobody holds is taken at once, and a scan that finds it held stops. The process id, computer name and
+    # start time written into the file are for people to read; they decide nothing.
+    # Only when the file cannot be opened for another reason, such as its permissions, is it unknown whether a scan
+    # holds it. Then its age decides: under six hours the scan stops, over six hours the file is replaced.
     $lockPath = Join-Path $OutputPath ".scan.lock"
     $staleAfter = [timespan]::FromHours(6)
-    $machineName = [System.Environment]::MachineName
-    $processStarted = "unknown"
-    try {
-        $processStarted = (Get-Process -Id $PID).StartTime.ToUniversalTime().ToString("o", [cultureinfo]::InvariantCulture)
-    }
-    catch {
-        Write-Verbose "The start time of this process could not be read, so the lock does not record it."
-    }
-
-    $createError = $null
-    for ($attempt = 1; $attempt -le 3; $attempt++) {
+    $openError = $null
+    for ($attempt = 1; $attempt -le 2; $attempt++) {
         $stream = $null
         try {
-            $stream = [System.IO.FileStream]::new($lockPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)
+            $stream = [System.IO.FileStream]::new($lockPath, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
         }
         catch {
-            $createError = $_
+            $openError = $_
         }
 
         if ($null -ne $stream) {
-            $text = "ProcessId: $PID`nProcessStartedAt: $processStarted`nMachineName: $machineName`nStartedAt: $($StartedUtc.ToString('o', [cultureinfo]::InvariantCulture))`n"
             try {
+                $previous = [System.IO.StreamReader]::new($stream, [System.Text.Encoding]::UTF8, $false, 1024, $true).ReadToEnd()
+                if (-not [string]::IsNullOrWhiteSpace($previous)) {
+                    # A scan empties the lock when it ends, so text in it was left by a scan that was killed.
+                    $holder = ConvertFrom-M365ScanLockText -Text $previous
+                    Write-M365MonitorError -Message "Took over the scan lock in $OutputPath from a scan that started $($holder.StartedAt) (process $($holder.ProcessId) on $($holder.MachineName)): that scan is no longer running, because no process holds the lock." -OutputPath $OutputPath
+                }
+                $text = "ProcessId: $PID`nMachineName: $([System.Environment]::MachineName)`nStartedAt: $($StartedUtc.ToString('o', [cultureinfo]::InvariantCulture))`n"
                 $bytes = [System.Text.Encoding]::UTF8.GetBytes($text)
+                $stream.SetLength(0)
+                $stream.Position = 0
                 $stream.Write($bytes, 0, $bytes.Length)
                 $stream.Flush($true)
             }
             catch {
                 $stream.Dispose()
-                $null = Remove-M365File -Path $lockPath
                 throw "Could not write the scan lock $lockPath. $($_.Exception.GetBaseException().Message)"
             }
-            return [pscustomobject]@{ Path = $lockPath; Stream = $stream; Text = $text }
+            return [pscustomobject]@{ Path = $lockPath; Stream = $stream; Text = $text; OutputPath = $OutputPath }
         }
 
-        $holder = Read-M365ScanLock -Path $lockPath
-        if ($null -eq $holder) {
-            # The other scan has just finished, or the lock cannot be created at all. Try again, then say why.
-            continue
+        $writtenUtc = [System.IO.File]::GetLastWriteTimeUtc($lockPath)
+        $writtenText = $writtenUtc.ToString("yyyy-MM-ddTHH:mm:ssZ", [cultureinfo]::InvariantCulture)
+        if (Test-M365LockConflict -ErrorRecord $openError) {
+            throw "Another scan is running in $OutputPath (started $writtenText)."
         }
 
-        $startedText = $holder.StartedUtc.ToString("yyyy-MM-ddTHH:mm:ssZ", [cultureinfo]::InvariantCulture)
-        $holderName = if ($holder.MachineName) { $holder.MachineName } else { "an unknown computer" }
-        $isOld = ([datetime]::UtcNow - $holder.StartedUtc) -ge $staleAfter
-        $state = "Unknown"
-        $sameMachine = -not [string]::IsNullOrWhiteSpace($holder.MachineName) -and [string]::Equals($holder.MachineName, $machineName, [System.StringComparison]::OrdinalIgnoreCase)
-        if ($sameMachine -and $holder.ProcessId -match '^\d+$') {
-            $state = Get-M365ScanLockHolderState -ProcessId ([int]$holder.ProcessId) -ProcessStartedUtc $holder.ProcessStartedUtc
+        $reason = $openError.Exception.GetBaseException().Message
+        if ($attempt -gt 1 -or -not [System.IO.File]::Exists($lockPath)) {
+            throw "Could not open the scan lock $lockPath. $reason"
         }
-
-        if ($state -eq "Running") {
-            if ($isOld) {
-                Write-M365MonitorError -Message "A scan in $OutputPath that started $startedText (process $($holder.ProcessId) on this computer) is still running after more than six hours, so this scan did not start." -OutputPath $OutputPath
-            }
-            throw "Another scan is running in $OutputPath (started $startedText). It is process $($holder.ProcessId) on this computer."
-        }
-        if ($state -eq "Gone") {
-            $reason = "process $($holder.ProcessId) on this computer is no longer running"
-        }
-        elseif (-not $isOld) {
-            throw "Another scan is running in $OutputPath (started $startedText). If no scan is running, delete $lockPath and run the scan again."
-        }
-        elseif ($sameMachine) {
-            $reason = "process $($holder.ProcessId) on this computer is running, but it cannot be shown to be the scan that wrote the lock, and the lock is more than six hours old"
-        }
-        else {
-            $reason = "it started more than six hours ago on another computer, so it is taken to have stopped without removing its lock"
-        }
-
-        # Read it again just before removing it, so a lock another scan took over a moment ago is left alone.
-        $again = Read-M365ScanLock -Path $lockPath
-        if ($null -eq $again -or $again.Text -ne $holder.Text) {
-            continue
+        if (([datetime]::UtcNow - $writtenUtc) -lt $staleAfter) {
+            throw "Another scan may be running in ${OutputPath}: the scan lock $lockPath cannot be opened ($reason), so whether a scan holds it cannot be told. It was last written at $writtenText, less than six hours ago, so this scan did not start. If no scan is running, fix the lock's permissions or delete it."
         }
         try {
+            [System.IO.File]::SetAttributes($lockPath, [System.IO.FileAttributes]::Normal)
             [System.IO.File]::Delete($lockPath)
         }
         catch {
-            # On Windows a lock that a live scan still holds open cannot be deleted.
-            throw "Another scan is running in $OutputPath (started $startedText). Its lock is still held open."
+            throw "The scan lock $lockPath cannot be opened ($reason) or removed ($($_.Exception.GetBaseException().Message)). Fix its permissions or delete it, then run the scan again."
         }
-        Write-M365MonitorError -Message "Took over the scan lock in $OutputPath from a scan that started $startedText (process $($holder.ProcessId) on $holderName): $reason." -OutputPath $OutputPath
+        Write-M365MonitorError -Message "Took over the scan lock in ${OutputPath}: it could not be opened ($reason) and was last written at $writtenText, more than six hours ago, so it was replaced." -OutputPath $OutputPath
     }
 
-    $reason = if ($createError) { $createError.Exception.GetBaseException().Message } else { "Another scan kept taking it." }
-    throw "Could not create the scan lock $lockPath. $reason"
+    throw "Could not open the scan lock $lockPath."
 }
 
 function Exit-M365ScanLock {
@@ -841,17 +763,24 @@ function Exit-M365ScanLock {
         [object]$Lock
     )
 
-    # Closes and deletes this scan's lock. It is deleted only while it still holds what this scan wrote, so a lock
-    # another scan took over is left alone. This runs in the script's finally block, which Ctrl+C also runs.
-    # SIGTERM and kills skip it; the next scan sees the process that wrote the lock is gone and takes the lock over.
+    # Empties the lock and lets go of it. The file stays: only the lock the operating system holds on it counts, and
+    # deleting it could let two scans lock two different files of the same name. This runs in the script's finally
+    # block, which Ctrl+C also runs. SIGTERM and kills skip it; the operating system lets go of the lock when the
+    # process ends, and the next scan takes it at once.
     if ($null -eq $Lock) {
         return
     }
 
-    $Lock.Stream.Dispose()
-    $current = Read-M365ScanLock -Path $Lock.Path
-    if ($null -ne $current -and $current.Text -eq $Lock.Text -and -not (Remove-M365File -Path $Lock.Path)) {
-        Write-Warning "Could not remove the scan lock $($Lock.Path). The next scan on this computer takes it over once this process has ended."
+    try {
+        $Lock.Stream.SetLength(0)
+        $Lock.Stream.Flush($true)
+    }
+    catch {
+        Write-M365MonitorError -Message "Could not empty the scan lock $($Lock.Path) on the way out, so it still names this scan. No process holds it once this one ends, so the next scan takes it at once." -ErrorRecord $_ -OutputPath $Lock.OutputPath
+        Write-Warning "Could not empty the scan lock $($Lock.Path). See errors.log."
+    }
+    finally {
+        $Lock.Stream.Dispose()
     }
 }
 
@@ -863,22 +792,55 @@ function Get-M365PreviousFinding {
     )
 
     # Reads the forwarding-findings.json the previous run wrote, before this run replaces it. Returns Rows and
-    # Unreadable. A missing file is a first run, not a problem. A file that is there but cannot be read means the
-    # findings it held cannot be kept, and the caller fails closed.
+    # Unreadable. With neither it nor summary.json there, this is a first run and nothing is wrong. Unreadable means
+    # the findings it held cannot be kept, and the caller fails closed: the file cannot be read, is not complete JSON,
+    # holds something other than a list of findings (null, a number, an object of another shape), or is missing
+    # although summary.json shows that an earlier run completed.
     $result = [pscustomobject]@{ Rows = @(); Unreadable = $false }
     $path = Join-Path $OutputPath "forwarding-findings.json"
+    $consequence = "so the last scan's findings could not be kept, and every account reported without a mailbox is counted as a failed read in this run."
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        if (Test-Path -LiteralPath (Join-Path $OutputPath "summary.json") -PathType Leaf) {
+            $result.Unreadable = $true
+            Write-M365MonitorError -Message "The previous forwarding-findings.json is missing although summary.json shows that an earlier run completed, $consequence" -OutputPath $OutputPath
+        }
         return $result
     }
 
     try {
-        $result.Rows = @(Read-M365JsonFile -Path $path | Where-Object { $_ -is [System.Management.Automation.PSCustomObject] })
+        $rows = @(Read-M365JsonFile -Path $path)
+        foreach ($row in $rows) {
+            if ($row -isnot [System.Management.Automation.PSCustomObject] -or [string]::IsNullOrWhiteSpace([string]$row.UserPrincipalName) -or
+                [string]::IsNullOrWhiteSpace([string]$row.ForwardingType)) {
+                throw "It holds something that is not a forwarding finding."
+            }
+        }
+        $result.Rows = $rows
     }
     catch {
         $result.Unreadable = $true
-        Write-M365MonitorError -Message "Could not read the previous forwarding-findings.json, so the last scan's findings could not be kept, and every account reported without a mailbox is counted as a failed read in this run." -ErrorRecord $_ -OutputPath $OutputPath
+        Write-M365MonitorError -Message "Could not read the previous forwarding-findings.json, $consequence" -ErrorRecord $_ -OutputPath $OutputPath
     }
     return $result
+}
+
+function Get-M365KeptBecause {
+    param(
+        [Parameter(Mandatory)]
+        [object]$Row
+    )
+
+    # Why a row of an earlier report was there: empty for a forward read in that run, Failed for one kept because a
+    # read failed, NoMailbox for one kept because the account said it had no mailbox. A kept row from a version that
+    # did not write the reason counts as Failed, so it gets the one-run grace.
+    $wasKept = $Row.PSObject.Properties.Name -contains "NotRechecked" -and $Row.NotRechecked -eq $true
+    if (-not $wasKept) {
+        return ""
+    }
+    if ($Row.PSObject.Properties.Name -contains "KeptBecause" -and [string]$Row.KeptBecause -eq "NoMailbox") {
+        return "NoMailbox"
+    }
+    return "Failed"
 }
 
 function Resolve-M365NoMailboxUser {
@@ -913,38 +875,46 @@ function Resolve-M365NoMailboxUser {
 
     # "No mailbox" means there is nothing to check, so it must not be what a blind read looks like. An account is
     # moved from a collector's no-mailbox list to its failed list, in place, when:
-    #   - the other collector read that account's mailbox in this run, so the mailbox is there;
-    #   - the previous report has forwards for that account that were read in that run (not themselves kept from an
-    #     earlier one), so it had a mailbox until now; or
-    #   - the previous report could not be read, so that cannot be told.
-    # A failed read keeps the last scan's findings and makes the run a partial scan; no mailbox does neither.
-    # So a mailbox that is removed costs one partial run with its forwards kept and marked; on the run after that,
-    # the forwards in the report are the kept ones, and the account is listed as having no mailbox.
+    #   - the other collector read that account's mailbox in this run, so the mailbox is there (kept as Failed);
+    #   - the previous report could not be read, so it cannot be told what the account had (kept as NoMailbox); or
+    #   - the previous report has a forward for the account that was read in that run, or kept because a read failed
+    #     (kept as NoMailbox). That is the one-run grace.
+    # A forward kept because of NoMailbox gets no second grace: when the account says it has no mailbox again, the
+    # account is listed under UsersWithoutMailbox and those forwards are dropped, with a line in errors.log.
+    # Returns the users moved for NoMailbox in each collector, so their kept rows record that reason.
     $comparer = [System.StringComparer]::OrdinalIgnoreCase
     $mailboxNotRead = [System.Collections.Generic.HashSet[string]]::new([string[]]@($FailedMailboxUsers + $NoMailboxUsers), $comparer)
     $rulesNotRead = [System.Collections.Generic.HashSet[string]]::new([string[]]@($FailedRuleUsers + $NoRuleMailboxUsers), $comparer)
-    $previousUsers = [System.Collections.Generic.HashSet[string]]::new($comparer)
-    $previousLiveUsers = [System.Collections.Generic.HashSet[string]]::new($comparer)
+    $graceUsers = [System.Collections.Generic.HashSet[string]]::new($comparer)
+    $previousMailboxUsers = [System.Collections.Generic.HashSet[string]]::new($comparer)
+    $previousRuleUsers = [System.Collections.Generic.HashSet[string]]::new($comparer)
     foreach ($row in @($PreviousFindings)) {
         $upn = [string]$row.UserPrincipalName
         if ([string]::IsNullOrWhiteSpace($upn)) { continue }
-        $null = $previousUsers.Add($upn)
-        $wasKept = $row.PSObject.Properties.Name -contains "NotRechecked" -and $row.NotRechecked -eq $true
-        if (-not $wasKept) { $null = $previousLiveUsers.Add($upn) }
+        if ((Get-M365KeptBecause -Row $row) -ne "NoMailbox") { $null = $graceUsers.Add($upn) }
+        if ([string]$row.ForwardingType -eq "MailboxForwarding") { $null = $previousMailboxUsers.Add($upn) } else { $null = $previousRuleUsers.Add($upn) }
     }
 
-    foreach ($collector in @(
-            @{ Label = "Mailbox forwarding"; Said = "Get-Mailbox reported no mailbox"; Other = "Microsoft Graph read the inbox rules in this run"; NoMailbox = $NoMailboxUsers; Failed = $FailedMailboxUsers; OtherNotRead = $rulesNotRead }
-            @{ Label = "Inbox rules"; Said = "Microsoft Graph reported no mailbox"; Other = "Get-Mailbox read the mailbox in this run"; NoMailbox = $NoRuleMailboxUsers; Failed = $FailedRuleUsers; OtherNotRead = $mailboxNotRead })) {
+    $collectors = @(
+        @{ Label = "Mailbox forwarding"; Kind = "mailbox forwarding"; Source = "Get-Mailbox"; Other = "Microsoft Graph read the inbox rules in this run"
+            NoMailbox = $NoMailboxUsers; Failed = $FailedMailboxUsers; OtherNotRead = $rulesNotRead; Previous = $previousMailboxUsers
+            KeptForNoMailbox = [System.Collections.Generic.HashSet[string]]::new($comparer) }
+        @{ Label = "Inbox rules"; Kind = "inbox rules"; Source = "Microsoft Graph"; Other = "Get-Mailbox read the mailbox in this run"
+            NoMailbox = $NoRuleMailboxUsers; Failed = $FailedRuleUsers; OtherNotRead = $mailboxNotRead; Previous = $previousRuleUsers
+            KeptForNoMailbox = [System.Collections.Generic.HashSet[string]]::new($comparer) }
+    )
+    foreach ($collector in $collectors) {
         foreach ($upn in @($collector.NoMailbox)) {
             $why = $null
+            $forNoMailbox = $true
             if (-not $collector.OtherNotRead.Contains($upn)) {
                 $why = $collector.Other
+                $forNoMailbox = $false
             }
             elseif ($PreviousReportUnreadable) {
                 $why = "the previous report could not be read to tell whether this account had forwards"
             }
-            elseif ($previousLiveUsers.Contains($upn)) {
+            elseif ($graceUsers.Contains($upn)) {
                 $why = "the last report has forwards for this account"
             }
             if ($null -eq $why) {
@@ -952,17 +922,24 @@ function Resolve-M365NoMailboxUser {
             }
             $null = $collector.NoMailbox.Remove($upn)
             $collector.Failed.Add($upn)
-            Write-M365MonitorError -Message "$($collector.Label) for ${upn}: $($collector.Said), but $why, so this is counted as a failed read." -OutputPath $OutputPath
+            if ($forNoMailbox) { $null = $collector.KeptForNoMailbox.Add($upn) }
+            Write-M365MonitorError -Message "$($collector.Label) for ${upn}: $($collector.Source) reported no mailbox, but $why, so this is counted as a failed read." -OutputPath $OutputPath
         }
     }
 
-    # An account still without a mailbox whose rows in the last report were all kept from an earlier run has had no
-    # mailbox for two runs. Its rows are not kept again; say so once, on the run they go.
-    $stillNoMailbox = @($NoMailboxUsers + $NoRuleMailboxUsers | Select-Object -Unique)
-    foreach ($upn in $stillNoMailbox) {
-        if ($previousUsers.Contains($upn) -and -not $previousLiveUsers.Contains($upn)) {
-            Write-M365MonitorError -Message "Dropped the earlier forwards for ${upn}: the account has had no mailbox for two runs, so the findings kept from before were removed from the report." -OutputPath $OutputPath
+    # What is left on a no-mailbox list with forwards in the last report had them kept because of NoMailbox, so this
+    # collector has now said twice that there is no mailbox. Those forwards are not kept again.
+    foreach ($collector in $collectors) {
+        foreach ($upn in @($collector.NoMailbox)) {
+            if ($collector.Previous.Contains($upn)) {
+                Write-M365MonitorError -Message "Dropped the earlier forwards for $upn ($($collector.Kind)): $($collector.Source) has reported no mailbox for two runs, so the findings kept from before were removed from the report." -OutputPath $OutputPath
+            }
         }
+    }
+
+    return [pscustomobject]@{
+        MailboxKeptForNoMailbox = @($collectors[0].KeptForNoMailbox)
+        RuleKeptForNoMailbox    = @($collectors[1].KeptForNoMailbox)
     }
 }
 
@@ -983,7 +960,11 @@ function Get-M365CarriedFinding {
 
         [Parameter()]
         [AllowEmptyCollection()]
-        [string[]]$NoMailboxUsers = @(),
+        [string[]]$MailboxKeptForNoMailbox = @(),
+
+        [Parameter()]
+        [AllowEmptyCollection()]
+        [string[]]$RuleKeptForNoMailbox = @(),
 
         [Parameter(Mandatory)]
         [object]$Settings,
@@ -994,10 +975,11 @@ function Get-M365CarriedFinding {
     )
 
     # Returns the rows of the previous report for users whose reads failed in this run, so a known forward does not
-    # drop off the report because of one bad read. A failed mailbox read keeps the user's mailbox forwarding rows and
-    # a failed inbox rule read keeps the user's inbox rule rows; what this run did read replaces the rest. Each kept
-    # row is marked NotRechecked and keeps the DetectedAt of the scan that found it. An account listed under
-    # UsersWithoutMailbox has nothing to forward, so its rows are not kept.
+    # drop off the report because of one bad read. Each collector decides for its own rows: a failed mailbox read
+    # keeps the user's mailbox forwarding rows, a failed inbox rule read keeps the user's inbox rule rows, and what
+    # this run did read replaces the rest. Each kept row is marked NotRechecked, keeps the DetectedAt of the scan that
+    # found it, and records in KeptBecause why it was kept: NoMailbox when the failure was a "no mailbox" answer
+    # counted as a failed read, Failed otherwise.
     #
     # The forward itself was not read again, but the rules it is judged by are this run's: IsExternal,
     # IsPersonalDomain, ApprovedException and RiskLevel are worked out again from ForwardTarget with the current
@@ -1005,7 +987,8 @@ function Get-M365CarriedFinding {
     $comparer = [System.StringComparer]::OrdinalIgnoreCase
     $mailboxFailed = [System.Collections.Generic.HashSet[string]]::new([string[]]@($MailboxFailedUsers), $comparer)
     $ruleFailed = [System.Collections.Generic.HashSet[string]]::new([string[]]@($RuleFailedUsers), $comparer)
-    $noMailbox = [System.Collections.Generic.HashSet[string]]::new([string[]]@($NoMailboxUsers), $comparer)
+    $mailboxForNoMailbox = [System.Collections.Generic.HashSet[string]]::new([string[]]@($MailboxKeptForNoMailbox), $comparer)
+    $ruleForNoMailbox = [System.Collections.Generic.HashSet[string]]::new([string[]]@($RuleKeptForNoMailbox), $comparer)
     if ($mailboxFailed.Count -eq 0 -and $ruleFailed.Count -eq 0) {
         return
     }
@@ -1015,14 +998,16 @@ function Get-M365CarriedFinding {
             continue
         }
         $upn = [string]$row.UserPrincipalName
-        if ([string]::IsNullOrWhiteSpace($upn) -or $noMailbox.Contains($upn)) {
+        if ([string]::IsNullOrWhiteSpace($upn)) {
             continue
         }
         # Plain assignments: an if expression would send the set down the pipeline and hand back its items.
-        $failedUsers = $ruleFailed
         $isMailboxRow = [string]$row.ForwardingType -eq "MailboxForwarding"
+        $failedUsers = $ruleFailed
+        $forNoMailbox = $ruleForNoMailbox
         if ($isMailboxRow) {
             $failedUsers = $mailboxFailed
+            $forNoMailbox = $mailboxForNoMailbox
         }
         if (-not $failedUsers.Contains($upn)) {
             continue
@@ -1048,6 +1033,7 @@ function Get-M365CarriedFinding {
         Add-M365Property -InputObject $row -Name "ApprovedException" -Value ([bool]$approved)
         Add-M365Property -InputObject $row -Name "RiskLevel" -Value (Get-M365ForwardingRiskLevel -RuleEnabled $enabled -IsExternal $isExternal -IsPersonalDomain $isPersonal -ApprovedException $approved)
         Add-M365Property -InputObject $row -Name "NotRechecked" -Value $true
+        Add-M365Property -InputObject $row -Name "KeptBecause" -Value $(if ($forNoMailbox.Contains($upn)) { "NoMailbox" } else { "Failed" })
         $row
     }
 }
@@ -1186,6 +1172,7 @@ $scanLock = $null
 # stopped part way, for example with Ctrl+C, has neither, and the finally block below makes it exit 1.
 $script:runCompleted = $false
 $script:runFailed = $false
+$script:filesPublished = $false
 
 try {
     # One scan per output folder. A second scan stops here, before it reads or writes anything else.
@@ -1260,7 +1247,7 @@ try {
         $previousFindings = @($previousReport.Rows)
         $previousReportUnreadable = [bool]$previousReport.Unreadable
     }
-    Resolve-M365NoMailboxUser -FailedMailboxUsers $failedMailboxUsers -NoMailboxUsers $noMailboxUsers -FailedRuleUsers $failedRuleUsers `
+    $resolved = Resolve-M365NoMailboxUser -FailedMailboxUsers $failedMailboxUsers -NoMailboxUsers $noMailboxUsers -FailedRuleUsers $failedRuleUsers `
         -NoRuleMailboxUsers $noRuleMailboxUsers -PreviousFindings $previousFindings -PreviousReportUnreadable:$previousReportUnreadable -OutputPath $outputPath
 
     # Every finding read in this run was checked in this run. For a user whose reads failed, the last scan's
@@ -1268,10 +1255,11 @@ try {
     # the report because of one bad read.
     foreach ($finding in @($mailboxForwarding + $ruleForwarding)) {
         Add-M365Property -InputObject $finding -Name "NotRechecked" -Value $false
+        Add-M365Property -InputObject $finding -Name "KeptBecause" -Value ""
     }
     $usersWithoutMailbox = @($noMailboxUsers + $noRuleMailboxUsers | Select-Object -Unique)
     $carriedFindings = @(Get-M365CarriedFinding -PreviousFindings $previousFindings -MailboxFailedUsers $failedMailboxUsers -RuleFailedUsers $failedRuleUsers `
-            -NoMailboxUsers $usersWithoutMailbox -Settings $settings -ApprovedExceptions $approvedExceptions)
+            -MailboxKeptForNoMailbox $resolved.MailboxKeptForNoMailbox -RuleKeptForNoMailbox $resolved.RuleKeptForNoMailbox -Settings $settings -ApprovedExceptions $approvedExceptions)
     if ($carriedFindings.Count -gt 0) {
         $mailboxForwarding = @($mailboxForwarding + @($carriedFindings | Where-Object { $_.ForwardingType -eq "MailboxForwarding" }))
         $ruleForwarding = @($ruleForwarding + @($carriedFindings | Where-Object { $_.ForwardingType -ne "MailboxForwarding" }))
@@ -1318,7 +1306,7 @@ try {
     $findingColumns = @(
         "UserPrincipalName", "DisplayName", "ForwardingType", "ForwardTarget", "TargetDomain", "IsExternal",
         "IsPersonalDomain", "ApprovedException", "RiskLevel", "DetectedAt",
-        "DeliverToMailboxAndForward", "RuleName", "RuleId", "RuleEnabled", "NotRechecked"
+        "DeliverToMailboxAndForward", "RuleName", "RuleId", "RuleEnabled", "NotRechecked", "KeptBecause"
     )
 
     Add-M365StagedFile -Staged $stagedFiles -RunId $runId -Path (Join-Path $outputPath "forwarding-findings.json") -Write {
@@ -1383,6 +1371,7 @@ try {
     }
 
     Publish-M365StagedFile -Staged $stagedFiles
+    $script:filesPublished = $true
     $dashboard = Join-Path $outputPath "dashboard.html"
 
     Write-Host ""
@@ -1412,7 +1401,16 @@ finally {
     Clear-M365StagedFile -Staged $stagedFiles
     Exit-M365ScanLock -Lock $scanLock
     if (-not $script:runCompleted -and -not $script:runFailed) {
-        Write-M365MonitorError -Message "Scan did not complete. It was stopped before the end, for example with Ctrl+C, and the previous run's files were left or put back as they were." -OutputPath $outputPath
+        $state = if ($script:filesPublished) {
+            "after this run's files were put in place, so the report files are this run's"
+        }
+        else {
+            "before this run's files were put in place, and the previous run's files were left or put back as they were"
+        }
+        Write-M365MonitorError -Message "Scan did not complete. It was stopped, for example with Ctrl+C, $state." -OutputPath $outputPath
+        # An exit inside the finally block of a script that is being stopped does not reach the process exit code
+        # under pwsh -File; telling the host to exit with 1 does.
+        $host.SetShouldExit(1)
         exit 1
     }
 }
