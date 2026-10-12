@@ -36,7 +36,7 @@ function Get-M365ForwardingInventory {
 
         # A mailbox that cannot be read is counted, never skipped silently: a scan that cannot see must not look clean.
         try {
-            $mailbox = Invoke-M365CallWithRetry -OperationName "Get-Mailbox $upn" -OutputPath $OutputPath -ThrowOnFailure -NoRetryPattern (Get-M365NoMailboxPattern -Source Mailbox) -ScriptBlock {
+            $mailbox = Invoke-M365CallWithRetry -OperationName "Get-Mailbox $upn" -OutputPath $OutputPath -ThrowOnFailure -NoRetryWhen { param($ErrorRecord) Test-M365NoMailboxError -ErrorRecord $ErrorRecord -Source Mailbox } -ScriptBlock {
                 Get-Mailbox -Identity $upn -ErrorAction Stop |
                     Select-Object DisplayName, UserPrincipalName, PrimarySmtpAddress, ForwardingAddress, ForwardingSmtpAddress, DeliverToMailboxAndForward
             }

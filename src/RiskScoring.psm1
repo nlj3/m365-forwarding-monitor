@@ -51,7 +51,12 @@ function Invoke-M365CallWithRetry {
         # An error whose text (message or error details) matches this pattern is not retried and is not logged
         # as a failure. The original error is rethrown so the caller can tell it from a call that gave up.
         [Parameter()]
-        [string]$NoRetryPattern
+        [string]$NoRetryPattern,
+
+        # The same as NoRetryPattern, decided by a script block that gets the error record and returns $true for an
+        # error that is an answer rather than a failure. It can look at the error's type and category, not only its text.
+        [Parameter()]
+        [scriptblock]$NoRetryWhen
     )
 
     for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
@@ -64,6 +69,9 @@ function Invoke-M365CallWithRetry {
                 if ("$($_.Exception.Message) $errorDetails" -match $NoRetryPattern) {
                     throw $_
                 }
+            }
+            if ($NoRetryWhen -and (& $NoRetryWhen $_)) {
+                throw $_
             }
 
             $statusCode = $null
@@ -389,9 +397,11 @@ function Get-M365NoMailboxPattern {
     )
 
     # What the two calls say when the account has no mailbox, as opposed to a call that failed.
-    # Exchange: the identity could not be found. Graph: MailboxNotEnabledForRESTAPI or ErrorItemNotFound.
+    # Exchange: the identity could not be found. Exchange Online puts the exception type name in the message
+    # ("Ex6F9304|Microsoft.Exchange.Configuration.Tasks.ManagementObjectNotFoundException|..."), and that part is not
+    # translated. Graph: MailboxNotEnabledForRESTAPI or ErrorItemNotFound.
     if ($Source -eq "Mailbox") {
-        return "couldn.t be found|could not be found"
+        return "couldn.t be found|could not be found|ManagementObjectNotFoundException"
     }
 
     return "MailboxNotEnabledForRESTAPI|ErrorItemNotFound"
@@ -409,7 +419,30 @@ function Test-M365NoMailboxError {
     )
 
     $errorDetails = if ($ErrorRecord.ErrorDetails) { [string]$ErrorRecord.ErrorDetails.Message } else { "" }
-    return ("$($ErrorRecord.Exception.Message) $errorDetails" -match (Get-M365NoMailboxPattern -Source $Source))
+    if ("$($ErrorRecord.Exception.Message) $errorDetails" -match (Get-M365NoMailboxPattern -Source $Source)) {
+        return $true
+    }
+    if ($Source -ne "Mailbox") {
+        # Graph answers with error codes, which are not translated, so the text is enough.
+        return $false
+    }
+
+    # Exchange translates its messages, so a localized "could not be found" is matched by the error's type or
+    # category instead. A command that is not loaded is ObjectNotFound too; that is a failure, never "no mailbox".
+    $exceptions = [System.Collections.Generic.List[System.Exception]]::new()
+    for ($exception = $ErrorRecord.Exception; $null -ne $exception; $exception = $exception.InnerException) {
+        $exceptions.Add($exception)
+    }
+    if (@($exceptions | Where-Object { $_ -is [System.Management.Automation.CommandNotFoundException] }).Count -gt 0) {
+        return $false
+    }
+    if (@($exceptions | Where-Object { $_.GetType().Name -eq "ManagementObjectNotFoundException" }).Count -gt 0) {
+        return $true
+    }
+    if ([string]$ErrorRecord.CategoryInfo.Reason -eq "ManagementObjectNotFoundException" -or [string]$ErrorRecord.FullyQualifiedErrorId -match "ManagementObjectNotFoundException") {
+        return $true
+    }
+    return $ErrorRecord.CategoryInfo.Category -eq [System.Management.Automation.ErrorCategory]::ObjectNotFound
 }
 
 function Get-M365BusinessHoursTimeZone {
@@ -469,6 +502,31 @@ function Protect-M365CsvText {
     return ($Text -replace '[\r\n]+', ' ')
 }
 
+function Write-M365TextFile {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [Parameter(Mandatory)]
+        [AllowEmptyString()]
+        [string]$Text
+    )
+
+    # Writes UTF-8 text without a byte order mark and flushes it through to the disk before the file is closed.
+    # Without the flush a file can be renamed into place while its content is still only in memory, and a crash or
+    # power cut seconds later leaves it empty or full of zeros.
+    $bytes = [System.Text.UTF8Encoding]::new($false).GetBytes($Text)
+    $stream = [System.IO.FileStream]::new($Path, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+    try {
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush($true)
+    }
+    finally {
+        $stream.Dispose()
+    }
+}
+
 function ConvertTo-M365CsvSafeValue {
     [CmdletBinding()]
     param([Parameter()][object]$Value)
@@ -500,5 +558,6 @@ Export-ModuleMember -Function @(
     "Get-M365OutboundRiskLevel",
     "Get-M365BusinessHoursTimeZone",
     "Get-M365BusinessHour",
+    "Write-M365TextFile",
     "ConvertTo-M365CsvSafeValue"
 )

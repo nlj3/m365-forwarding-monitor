@@ -119,6 +119,14 @@ function Connect-M365Monitor {
         throw "Microsoft Graph authentication did not complete. The scan cannot list users or inbox rules without Graph access."
     }
 
+    # With ExchangeOrganization set, the interactive and device-code sign-ins are pinned to that tenant too, so
+    # Exchange cannot land in a different tenant than Graph. A session in the wrong tenant would find no mailbox
+    # for any user.
+    $organizationParameter = @{}
+    if (-not [string]::IsNullOrWhiteSpace($exchangeOrganization)) {
+        $organizationParameter["Organization"] = $exchangeOrganization
+    }
+
     Invoke-M365CallWithRetry -OperationName "Connect-ExchangeOnline" -OutputPath $OutputPath -MaxAttempts 1 -ThrowOnFailure -ScriptBlock {
         if ($useAppOnlyCertificate) {
             Write-Host "Connecting to Exchange Online with app-only certificate authentication."
@@ -126,11 +134,11 @@ function Connect-M365Monitor {
         }
         elseif ($UseDeviceAuthentication) {
             Write-Host "Connecting to Exchange Online. A device-code login prompt may appear next."
-            Connect-ExchangeOnline -Device -ShowBanner:$false -ErrorAction Stop | Out-Null
+            Connect-ExchangeOnline -Device @organizationParameter -ShowBanner:$false -ErrorAction Stop | Out-Null
         }
         else {
             Write-Host "Connecting to Exchange Online."
-            Connect-ExchangeOnline -ShowBanner:$false -ErrorAction Stop | Out-Null
+            Connect-ExchangeOnline @organizationParameter -ShowBanner:$false -ErrorAction Stop | Out-Null
         }
     } | Out-Null
 }

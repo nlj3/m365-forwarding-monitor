@@ -36,7 +36,7 @@ function Get-M365MessageRuleForwarding {
 
         # Rules that cannot be read are counted, never skipped silently: a scan that cannot see must not look clean.
         try {
-            $rules = Invoke-M365CallWithRetry -OperationName "Graph messageRules $upn" -OutputPath $OutputPath -ThrowOnFailure -NoRetryPattern (Get-M365NoMailboxPattern -Source InboxRules) -ScriptBlock {
+            $rules = Invoke-M365CallWithRetry -OperationName "Graph messageRules $upn" -OutputPath $OutputPath -ThrowOnFailure -NoRetryWhen { param($ErrorRecord) Test-M365NoMailboxError -ErrorRecord $ErrorRecord -Source InboxRules } -ScriptBlock {
                 Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/users/$upn/mailFolders/inbox/messageRules" -ErrorAction Stop
             }
         }
