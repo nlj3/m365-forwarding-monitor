@@ -181,6 +181,7 @@ $summary = [pscustomobject]@{
     AbnormalOutboundCount         = @($outboundCounts | Where-Object { $_.RiskLevel -in @('Medium', 'Critical') }).Count
     AboveBaselineOutboundCount    = @($outboundCounts | Where-Object { $_.IsAboveBaseline }).Count
     TraceTruncated                = $false
+    UsersWithoutMailbox           = [pscustomobject]@{ Count = 0; UserPrincipalNames = @() }
     CollectionFailures            = [pscustomobject]@{
         MailboxForwarding = [pscustomobject]@{ Count = 0; UserPrincipalNames = @() }
         InboxRules        = [pscustomobject]@{ Count = 0; UserPrincipalNames = @() }

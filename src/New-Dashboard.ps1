@@ -13,6 +13,7 @@ function Get-M365DashboardWarningHtml {
     # Older summaries have no failure fields, so a missing field counts as nothing to report.
     $maxNamesListed = 25
     $lines = [System.Collections.Generic.List[string]]::new()
+    $hasUnreadUsers = $false
 
     $failures = if ($Summary.PSObject.Properties.Name -contains "CollectionFailures") { $Summary.CollectionFailures } else { $null }
     foreach ($item in @(
@@ -22,9 +23,14 @@ function Get-M365DashboardWarningHtml {
 
         $names = @($item.Failure.UserPrincipalNames)
         $listed = @($names | Select-Object -First $maxNamesListed | ForEach-Object { ConvertTo-M365Html $_ }) -join ", "
-        if ($names.Count -gt $maxNamesListed) { $listed += " and $($names.Count - $maxNamesListed) more" }
+        if ($names.Count -gt $maxNamesListed) {
+            # Every name is listed. The first ones are in view and the rest are one click away.
+            $rest = @($names | Select-Object -Skip $maxNamesListed | ForEach-Object { ConvertTo-M365Html $_ }) -join ", "
+            $listed += " <details><summary>and $($names.Count - $maxNamesListed) more</summary>$rest</details>"
+        }
         $noun = if ([int]$item.Failure.Count -eq 1) { "user" } else { "users" }
         $lines.Add("$($item.Label) could not be read for $([int]$item.Failure.Count) ${noun}: $listed")
+        $hasUnreadUsers = $true
     }
 
     if ($Summary.PSObject.Properties.Name -contains "TraceTruncated" -and $Summary.TraceTruncated -eq $true) {
@@ -34,13 +40,14 @@ function Get-M365DashboardWarningHtml {
     if ($lines.Count -eq 0) { return "" }
 
     $items = ($lines | ForEach-Object { "<li>$_</li>" }) -join "`n        "
+    $keptNote = if ($hasUnreadUsers) { "Forwards that an earlier scan found for these users are still listed, marked not re-checked. " } else { "" }
     return @"
 <section class="warning" role="alert">
-      <strong>Incomplete scan.</strong> The results below leave out what could not be read.
+      <strong>Incomplete scan.</strong> This run could not read everything it covers.
       <ul>
         $items
       </ul>
-      Check errors.log, fix the cause, and run the scan again.
+      ${keptNote}Check errors.log, fix the cause, and run the scan again.
     </section>
 "@
 }
@@ -107,7 +114,12 @@ function New-M365ForwardingDashboard {
 
     $riskRows = if ($topRisky.Count -gt 0) {
         $topRisky | ForEach-Object {
-            "<tr><td>$(ConvertTo-M365Html $_.UserPrincipalName)</td><td>$(ConvertTo-M365Html $_.ForwardingType)</td><td>$(ConvertTo-M365Html $_.ForwardTarget)</td><td>$(ConvertTo-M365Html $_.TargetDomain)</td><td><span class='badge $($_.RiskLevel)'>$($_.RiskLevel)</span></td><td>$(ConvertTo-M365Html $_.DetectedAt)</td></tr>"
+            $detected = ConvertTo-M365Html $_.DetectedAt
+            if ($_.PSObject.Properties.Name -contains "NotRechecked" -and $_.NotRechecked -eq $true) {
+                # Kept from an earlier scan because this run could not read the user.
+                $detected += "<br><span class='stale'>not re-checked</span>"
+            }
+            "<tr><td>$(ConvertTo-M365Html $_.UserPrincipalName)</td><td>$(ConvertTo-M365Html $_.ForwardingType)</td><td>$(ConvertTo-M365Html $_.ForwardTarget)</td><td>$(ConvertTo-M365Html $_.TargetDomain)</td><td><span class='badge $($_.RiskLevel)'>$($_.RiskLevel)</span></td><td>$detected</td></tr>"
         }
     }
     else {
@@ -163,6 +175,7 @@ function New-M365ForwardingDashboard {
     .Critical { background:var(--critical); } .High { background:var(--high); } .Medium { background:var(--medium); } .Low { background:var(--low); } .Exception, .Approved { background:var(--exception); }
     .warning { background:#fff4e5; border:1px solid #f0b86e; color:#5b3a00; border-radius:8px; padding:14px 18px; margin-bottom:18px; line-height:1.45; }
     .warning ul { margin:8px 0; padding-left:20px; }
+    .stale { display:inline-block; margin-top:4px; padding:1px 8px; border:1px solid #f0b86e; border-radius:999px; background:#fff4e5; color:#5b3a00; font-size:12px; }
     .empty { color:var(--muted); text-align:center; padding:22px; }
     footer { color:var(--muted); font-size:12px; padding:0 36px 26px; }
     @media (max-width: 720px) { header, main, footer { padding-left:18px; padding-right:18px; } table { display:block; overflow-x:auto; white-space:nowrap; } }
