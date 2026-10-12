@@ -239,9 +239,11 @@ Open `output/dashboard.html` in a browser. Review high and critical findings fir
 
 The dashboard displays no email content, subjects, previews, or attachments.
 
-If a collector could not check some users, the dashboard opens with a warning and `summary.json` lists them under `CollectionFailures`; `summary.csv` carries the same counts as columns. An enabled account with no mailbox, such as an unlicensed user, shows up in that list because the mailbox read fails for it. If every user failed, or the user list or the message trace could not be read at all, the run stops with an error and leaves the previous output in place rather than reporting a clean tenant it never saw. A message trace that hit the 5,000-row limit sets `TraceTruncated` on the summary and in the dashboard.
+If a collector could not check some users, the dashboard opens with a warning and `summary.json` lists them under `CollectionFailures`; `summary.csv` carries the same counts as columns. Accounts with no mailbox, such as unlicensed users, are counted separately under `UsersWithoutMailbox` and are not failures. A user whose reads did fail keeps last run's findings, marked as not re-checked, so a known forward does not vanish because of one bad read. If every user failed, or the user list or the message trace could not be read at all, the run stops with an error and leaves the previous output in place rather than reporting a clean tenant it never saw. A message trace that hit the 5,000-row limit sets `TraceTruncated` on the summary and in the dashboard.
 
-Output files are written to hidden temporary files in `output/` and moved into place together at the end of the run, with the dashboard last, so a reader never sees a half-updated set. If one of them is read-only, for example a CSV held open in a spreadsheet on Windows, the run stops before replacing anything.
+Output files are written to hidden temporary files in `output/`, each existing file is copied aside, and then each new file is swapped into place with an atomic replace, dashboard last. If a swap fails, for example because a spreadsheet on Windows has a CSV locked, the files already swapped are put back, so a failed run leaves the previous run's set intact. A process killed in the middle of the swaps leaves every file whole, either old or new, and the next run cleans up the copies. Only one scan runs in an output folder at a time; a second one stops, and a lock left by a dead scan is taken over after six hours.
+
+The run exits 0 when every user was checked, 2 when it finished but some users could not be checked, and 1 when it stopped without replacing anything.
 
 ## Troubleshooting
 
