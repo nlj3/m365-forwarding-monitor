@@ -6,12 +6,38 @@ function ConvertTo-M365Html {
     return [System.Net.WebUtility]::HtmlEncode([string]$Value)
 }
 
+function Get-M365NameListHtml {
+    param([Parameter()][AllowEmptyCollection()][object[]]$Names = @())
+
+    # Every name is listed, encoded. The first 25 are in view and the rest are one click away.
+    $maxNamesListed = 25
+    $listed = @($Names | Select-Object -First $maxNamesListed | ForEach-Object { ConvertTo-M365Html $_ }) -join ", "
+    if ($Names.Count -gt $maxNamesListed) {
+        $rest = @($Names | Select-Object -Skip $maxNamesListed | ForEach-Object { ConvertTo-M365Html $_ }) -join ", "
+        $listed += " <details><summary>and $($Names.Count - $maxNamesListed) more</summary>$rest</details>"
+    }
+    return $listed
+}
+
+function Get-M365DashboardNoMailboxHtml {
+    param([Parameter(Mandatory)][object]$Summary)
+
+    # Accounts with no mailbox are not a failure, but they were not checked, so the page names them whenever there
+    # are any, on a line of its own under the warning block.
+    if ($Summary.PSObject.Properties.Name -notcontains "UsersWithoutMailbox" -or $null -eq $Summary.UsersWithoutMailbox) { return "" }
+    $count = [int]$Summary.UsersWithoutMailbox.Count
+    if ($count -le 0) { return "" }
+
+    $listed = Get-M365NameListHtml -Names @($Summary.UsersWithoutMailbox.UserPrincipalNames)
+    $sentence = if ($count -eq 1) { "1 account has no mailbox and was not checked" } else { "$count accounts have no mailbox and were not checked" }
+    return "<p class=`"note`">${sentence}: $listed</p>"
+}
+
 function Get-M365DashboardWarningHtml {
     param([Parameter(Mandatory)][object]$Summary)
 
     # A scan that could not see everything must say so at the top of the page.
     # Older summaries have no failure fields, so a missing field counts as nothing to report.
-    $maxNamesListed = 25
     $lines = [System.Collections.Generic.List[string]]::new()
     $hasUnreadUsers = $false
 
@@ -21,13 +47,7 @@ function Get-M365DashboardWarningHtml {
             @{ Label = "Inbox rules"; Failure = $(if ($failures) { $failures.InboxRules }) })) {
         if ($null -eq $item.Failure -or [int]$item.Failure.Count -le 0) { continue }
 
-        $names = @($item.Failure.UserPrincipalNames)
-        $listed = @($names | Select-Object -First $maxNamesListed | ForEach-Object { ConvertTo-M365Html $_ }) -join ", "
-        if ($names.Count -gt $maxNamesListed) {
-            # Every name is listed. The first ones are in view and the rest are one click away.
-            $rest = @($names | Select-Object -Skip $maxNamesListed | ForEach-Object { ConvertTo-M365Html $_ }) -join ", "
-            $listed += " <details><summary>and $($names.Count - $maxNamesListed) more</summary>$rest</details>"
-        }
+        $listed = Get-M365NameListHtml -Names @($item.Failure.UserPrincipalNames)
         $noun = if ([int]$item.Failure.Count -eq 1) { "user" } else { "users" }
         $lines.Add("$($item.Label) could not be read for $([int]$item.Failure.Count) ${noun}: $listed")
         $hasUnreadUsers = $true
@@ -35,6 +55,10 @@ function Get-M365DashboardWarningHtml {
 
     if ($Summary.PSObject.Properties.Name -contains "TraceTruncated" -and $Summary.TraceTruncated -eq $true) {
         $lines.Add("The message trace reached its row limit, so outbound counts can be too low.")
+    }
+
+    if ($Summary.PSObject.Properties.Name -contains "BaselineDegraded" -and $Summary.BaselineDegraded -eq $true) {
+        $lines.Add("The outbound baseline history could not be read, so this run compared outbound counts with no history and left the file as it was.")
     }
 
     if ($lines.Count -eq 0) { return "" }
@@ -80,6 +104,7 @@ function New-M365ForwardingDashboard {
 
     $dashboardPath = if ([string]::IsNullOrWhiteSpace($FilePath)) { Join-Path $OutputPath "dashboard.html" } else { $FilePath }
     $warningHtml = Get-M365DashboardWarningHtml -Summary $Summary
+    $noMailboxHtml = Get-M365DashboardNoMailboxHtml -Summary $Summary
     $generatedAt = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss zzz")
 
     $riskOrder = @{ Critical = 1; High = 2; Medium = 3; Low = 4; Exception = 5; Approved = 5 }
@@ -128,7 +153,12 @@ function New-M365ForwardingDashboard {
 
     $domainRows = if ($topDomains.Count -gt 0) {
         $topDomains | ForEach-Object {
-            "<tr><td>$(ConvertTo-M365Html $_.Name)</td><td>$($_.Count)</td></tr>"
+            $count = "$($_.Count)"
+            $kept = @($_.Group | Where-Object { $_.PSObject.Properties.Name -contains "NotRechecked" -and $_.NotRechecked -eq $true }).Count
+            if ($kept -gt 0) {
+                $count += " <span class='stale'>$kept not re-checked</span>"
+            }
+            "<tr><td>$(ConvertTo-M365Html $_.Name)</td><td>$count</td></tr>"
         }
     }
     else {
@@ -176,6 +206,7 @@ function New-M365ForwardingDashboard {
     .warning { background:#fff4e5; border:1px solid #f0b86e; color:#5b3a00; border-radius:8px; padding:14px 18px; margin-bottom:18px; line-height:1.45; }
     .warning ul { margin:8px 0; padding-left:20px; }
     .stale { display:inline-block; margin-top:4px; padding:1px 8px; border:1px solid #f0b86e; border-radius:999px; background:#fff4e5; color:#5b3a00; font-size:12px; }
+    .note { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:12px 18px; margin:0 0 18px; line-height:1.45; }
     .empty { color:var(--muted); text-align:center; padding:22px; }
     footer { color:var(--muted); font-size:12px; padding:0 36px 26px; }
     @media (max-width: 720px) { header, main, footer { padding-left:18px; padding-right:18px; } table { display:block; overflow-x:auto; white-space:nowrap; } }
@@ -188,6 +219,7 @@ function New-M365ForwardingDashboard {
   </header>
   <main>
     $warningHtml
+    $noMailboxHtml
     <div class="cards">
       $($cardHtml -join "`n      ")
     </div>
@@ -218,6 +250,6 @@ function New-M365ForwardingDashboard {
 </html>
 "@
 
-    Set-Content -LiteralPath $dashboardPath -Value $html -Encoding UTF8
+    Write-M365TextFile -Path $dashboardPath -Text ($html + [Environment]::NewLine)
     return $dashboardPath
 }

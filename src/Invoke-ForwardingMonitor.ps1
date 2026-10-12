@@ -10,13 +10,20 @@ settings file. It does not change anything in the tenant.
 A scan that cannot see must not look clean. A single call that fails (the user list, the message trace) stops the
 run. A mailbox or inbox that cannot be read is counted and named in summary.json and on the dashboard, and if no
 user could be read in a collector the run stops. An account that has no mailbox is not a failure; it is listed
-under UsersWithoutMailbox. For a user whose reads failed, the forwards found by the last scan are kept in the
-report and marked NotRechecked, so a known forward does not drop off because of one bad read.
+under UsersWithoutMailbox and named on the dashboard. "No mailbox" is not taken on trust: when one collector says
+it but the other read that mailbox in the same run, or the last report has forwards for that account, it counts as
+a failed read; and when a collector says it for every user, the run stops, because the session is probably in the
+wrong tenant or lacks recipient scope. For a user whose reads failed, the forwards found by the last scan are kept
+in the report, scored again with the current settings and exceptions, and marked NotRechecked, so a known forward
+does not drop off because of one bad read. A baseline history that cannot be read is left as it is and the run is
+reported as degraded (BaselineDegraded in summary.json).
 
-The report files are written to hidden temporary files first and then swapped into place one by one, each with an
-atomic replace, dashboard last. If a swap fails, the files already swapped are put back, so the output folder holds
-either the previous run or this one. What an interrupted run left behind is cleaned up at the start of the next one,
-and only one scan runs in an output folder at a time: the scan holds output/.scan.lock while it runs.
+The report files are written to hidden temporary files, flushed to the disk, and then swapped into place one by
+one, each with an atomic replace, dashboard last. If a swap fails, the files already swapped are put back, so the
+output folder holds either the previous run or this one. What an interrupted run left behind is cleaned up at the
+start of the next one. Only one scan runs in an output folder at a time: the scan holds output/.scan.lock while it
+runs. A lock left on this computer by a process that is no longer running is taken over at once; a lock from
+another computer is respected for six hours.
 
 .PARAMETER SettingsPath
 Path to settings.json. A relative path is read from the folder this script is in.
@@ -33,10 +40,15 @@ Sign in with a device code instead of a browser window.
 .NOTES
 Exit codes, so a scheduler can tell the three outcomes apart:
   0  A clean run. Every user was read and the reports were written.
-  1  A stopped run. A call failed, no user could be read, an output file could not be replaced, or another scan
-     holds the output folder. An error is thrown and the report files are left as the previous run wrote them.
-  2  A partial scan. The reports were written, but at least one mailbox or inbox could not be read. The
-     dashboard has a warning that names the users, and summary.json lists them under CollectionFailures.
+  1  A stopped run. A call failed, no user could be read, a collector found no mailbox for any user, an output file
+     could not be replaced, or another scan holds the output folder. An error is thrown and the report files are
+     left as the previous run wrote them.
+  2  A partial scan. The reports were written, but at least one mailbox or inbox could not be read, or the outbound
+     baseline history could not be read. The dashboard has a warning that says which, and summary.json lists the
+     users under CollectionFailures and sets BaselineDegraded.
+A process that is killed while it swaps files (SIGKILL, a power cut) gets no exit code and cannot put anything back:
+the files already swapped stay in place, so the folder can hold some files from that run and the rest from the run
+before it until the next scan. Each file is whole, either old or new.
 #>
 [CmdletBinding()]
 param(
@@ -110,7 +122,7 @@ function Write-M365JsonReport {
 
     # Always a JSON array, so a single item and an empty set read back the same way as any other set.
     # (ConvertTo-Json with the pipeline would turn one item into a bare object and write nothing for none.)
-    Set-Content -LiteralPath $Path -Value (ConvertTo-Json -InputObject @($InputObject) -Depth $Depth) -Encoding UTF8
+    Write-M365TextFile -Path $Path -Text ((ConvertTo-Json -InputObject @($InputObject) -Depth $Depth) + [Environment]::NewLine)
 }
 
 function Read-M365JsonFile {
@@ -139,6 +151,65 @@ function Read-M365JsonFile {
     }
 
     ConvertFrom-Json -InputObject $text
+}
+
+function Write-M365CsvFile {
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object[]]$InputObject,
+
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    # The same text Export-Csv writes, through Write-M365TextFile so it reaches the disk before it is renamed into place.
+    $lines = @($InputObject | ConvertTo-Csv -NoTypeInformation)
+    $text = if ($lines.Count -gt 0) { ($lines -join [Environment]::NewLine) + [Environment]::NewLine } else { "" }
+    Write-M365TextFile -Path $Path -Text $text
+}
+
+function Test-M365IsoTimestamp {
+    [CmdletBinding()]
+    param(
+        [Parameter()]
+        [AllowNull()]
+        [object]$Value
+    )
+
+    # True for an ISO 8601 date and time, the form the collectors write DetectedAt in. ConvertFrom-Json turns such
+    # text into a date, so a date here came from it. Text that is still text must be ISO 8601 itself. A number,
+    # true or false, empty text or null is not a time this tool wrote, even where a [datetime] cast would take it.
+    if ($Value -is [datetime]) {
+        return $true
+    }
+    if ($Value -isnot [string]) {
+        return $false
+    }
+    $parsed = [datetimeoffset]::MinValue
+    return [datetimeoffset]::TryParseExact($Value, [string[]]@("yyyy-MM-ddTHH:mm:ss.FFFFFFFK", "yyyy-MM-ddTHH:mm:ssK"),
+        [cultureinfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$parsed)
+}
+
+function Read-M365HistoryFile {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    # Returns the records of an outbound baseline history file. Throws when the file cannot be read, is not complete
+    # JSON, or holds anything other than records with an ISO 8601 DetectedAt.
+    $records = @(Read-M365JsonFile -Path $Path)
+    foreach ($record in $records) {
+        if ($record -isnot [System.Management.Automation.PSCustomObject]) {
+            throw "It holds a value that is not a history record."
+        }
+        if ($record.PSObject.Properties.Name -notcontains "DetectedAt" -or -not (Test-M365IsoTimestamp -Value $record.DetectedAt)) {
+            throw "It holds a record whose DetectedAt is not an ISO 8601 date and time."
+        }
+    }
+    $records
 }
 
 function New-M365RunId {
@@ -170,6 +241,65 @@ function Remove-M365File {
     }
     catch {
         return $false
+    }
+}
+
+function Move-M365File {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Source,
+
+        [Parameter(Mandatory)]
+        [string]$Destination
+    )
+
+    # One rename that replaces the destination in one step: rename(2) on Linux and macOS, an atomic replace on Windows.
+    [System.IO.File]::Move($Source, $Destination, $true)
+}
+
+function Test-M365TransientFileError {
+    param(
+        [Parameter(Mandatory)]
+        [System.Management.Automation.ErrorRecord]$ErrorRecord
+    )
+
+    # True for an error that can clear up by itself, such as a file another program holds open for a moment.
+    # A file or folder that is not there does not appear by waiting.
+    for ($exception = $ErrorRecord.Exception; $null -ne $exception; $exception = $exception.InnerException) {
+        if ($exception -is [System.IO.FileNotFoundException] -or $exception -is [System.IO.DirectoryNotFoundException]) {
+            return $false
+        }
+        if ($exception -is [System.IO.IOException] -or $exception -is [System.UnauthorizedAccessException]) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Move-M365FileWithRetry {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Source,
+
+        [Parameter(Mandatory)]
+        [string]$Destination
+    )
+
+    # On Windows, Excel, an indexer or a sync agent can hold a file for a moment, and a replace fails while it does.
+    # A move that fails that way is tried three times in all, two seconds apart, before the caller gives up.
+    for ($attempt = 1; ; $attempt++) {
+        try {
+            Move-M365File -Source $Source -Destination $Destination
+            return
+        }
+        catch {
+            if ($attempt -ge 3 -or -not (Test-M365TransientFileError -ErrorRecord $_)) {
+                throw
+            }
+            Start-Sleep -Seconds 2
+        }
     }
 }
 
@@ -210,9 +340,8 @@ function Publish-M365StagedFile {
         [System.Collections.Generic.List[object]]$Staged
     )
 
-    # Puts the staged files in place in the order they were staged (the dashboard is staged last). A failed swap
-    # puts the files already swapped back, so a failed run leaves the previous run's set intact. A process killed
-    # in the middle of the swaps leaves every file whole, old or new, and the next run's sweep removes the copies.
+    # Puts the staged files in place in the order they were staged (the dashboard is staged last). If a step fails,
+    # the folder is left holding the previous run's files, never a mix.
     #
     # Every destination is checked first, so one that cannot be replaced stops the run before any file changes.
     # A destination must be missing or a plain file that is not read-only. A folder or a link is neither.
@@ -222,14 +351,18 @@ function Publish-M365StagedFile {
     # for a moment, so a program reading the file gets the old one or the new one. The backup is a copy rather than
     # a rename of the current file because a rename would leave the name empty until the new file moved in.
     #
-    # If a step fails, the files already replaced are put back from their backups, newest first, a file this run
-    # created where there was none is removed again, and the temporary files and backups are deleted. When every
-    # file is in place, the backups are deleted.
+    # If a step fails, or the scan is stopped with Ctrl+C, the files already replaced are put back from their
+    # backups, newest first, a file this run created where there was none is removed again, and the temporary files
+    # and backups are deleted. A backup that cannot be put back is kept, named in the error and listed in .keep,
+    # so later cleanups leave it in place. When every file is in place, the backups are deleted.
     $completed = [System.Collections.Generic.List[object]]::new()
-    $notRestored = [System.Collections.Generic.List[string]]::new()
+    $notRestored = [System.Collections.Generic.List[object]]::new()
     $current = $null
+    $moveFailedItem = $null
     $checking = $true
+    $allPlaced = $false
     $failure = $null
+    $keepWriteFailed = $false
     try {
         foreach ($item in $Staged) {
             $existing = [System.IO.FileInfo]::new($item.Path)
@@ -251,38 +384,63 @@ function Publish-M365StagedFile {
             if ($hasBackup) {
                 [System.IO.File]::Copy($item.Path, $item.BackupPath, $true)
             }
-            [System.IO.File]::Move($item.TempPath, $item.Path, $true)
+            # Recorded before the move, so a Ctrl+C that lands right after the move still puts this file back. If the
+            # move has not happened, putting the file back from its backup changes nothing.
             $completed.Add([pscustomobject]@{ Item = $item; HasBackup = $hasBackup })
+            try {
+                Move-M365FileWithRetry -Source $item.TempPath -Destination $item.Path
+            }
+            catch {
+                # The move failed, so this file was not replaced and needs nothing put back.
+                $moveFailedItem = $item
+                throw
+            }
             Write-Verbose "Put $(Split-Path -Leaf $item.Path) in place."
         }
+        $allPlaced = $true
     }
     catch {
         $failure = $_
     }
     finally {
-        # Also runs when the scan is stopped with Ctrl+C part way through, which the catch above does not see.
-        if ($completed.Count -lt $Staged.Count) {
+        if (-not $allPlaced) {
             for ($index = $completed.Count - 1; $index -ge 0; $index--) {
                 $done = $completed[$index]
-                try {
-                    if ($done.HasBackup) {
-                        [System.IO.File]::Move($done.Item.BackupPath, $done.Item.Path, $true)
+                if ([object]::ReferenceEquals($done.Item, $moveFailedItem)) {
+                    continue
+                }
+                if ($done.HasBackup) {
+                    try {
+                        Move-M365FileWithRetry -Source $done.Item.BackupPath -Destination $done.Item.Path
                     }
-                    else {
-                        # There was no file here before this run, so putting the folder back means removing it.
-                        [System.IO.File]::Delete($done.Item.Path)
+                    catch {
+                        $notRestored.Add($done)
                     }
                 }
-                catch {
-                    $notRestored.Add($done.Item.Path)
+                elseif (-not (Remove-M365File -Path $done.Item.Path)) {
+                    # There was no file here before this run, so putting the folder back means removing it.
+                    $notRestored.Add($done)
                 }
             }
 
+            $keep = [System.Collections.Generic.List[string]]::new()
             foreach ($item in $Staged) {
                 $null = Remove-M365File -Path $item.TempPath
-                # A backup that could not be put back is the only copy of that file's previous content, so it stays.
-                if (-not $notRestored.Contains($item.Path)) {
+                $kept = @($notRestored | Where-Object { $_.HasBackup -and [object]::ReferenceEquals($_.Item, $item) }).Count -gt 0
+                if ($kept) {
+                    # The only copy of that file's previous content. .keep tells later cleanups to leave it.
+                    $keep.Add((Split-Path -Leaf $item.BackupPath))
+                }
+                else {
                     $null = Remove-M365File -Path $item.BackupPath
+                }
+            }
+            if ($keep.Count -gt 0) {
+                try {
+                    [System.IO.File]::AppendAllLines((Join-Path (Split-Path -Parent $Staged[0].Path) ".keep"), [string[]]$keep.ToArray())
+                }
+                catch {
+                    $keepWriteFailed = $true
                 }
             }
         }
@@ -296,7 +454,16 @@ function Publish-M365StagedFile {
         $reason = $failure.Exception.GetBaseException().Message.Trim()
         if ($reason -notmatch "[.!?]$") { $reason += "." }
         if ($notRestored.Count -gt 0) {
-            throw "Could not put $($current.Path) in place. $reason These files could not be put back and may hold this run's content: $($notRestored -join ', '). The previous content of each is in the .prev file beside it; copy it out before the next scan, which removes leftovers."
+            $details = foreach ($done in $notRestored) {
+                if ($done.HasBackup) {
+                    "$($done.Item.Path) could not be put back; its previous content is kept in $(Split-Path -Leaf $done.Item.BackupPath) beside it, which later scans leave in place because .keep lists it"
+                }
+                else {
+                    "$($done.Item.Path) was created by this run and could not be removed"
+                }
+            }
+            $keepNote = if ($keepWriteFailed) { " .keep could not be written, so copy the kept files somewhere else before the next scan." } else { "" }
+            throw "Could not put $($current.Path) in place. $reason Some files could not be put back: $($details -join '; '). The other files were put back.$keepNote"
         }
         throw "Could not put $($current.Path) in place. $reason The previous run's files were put back, so the output folder is as it was before this run."
     }
@@ -338,8 +505,26 @@ function Repair-M365OutputFolder {
 
     # Cleans up after a run that stopped part way, for example one that was killed while it put files in place.
     # It runs at the start of a scan, once the scan holds the lock and before it stages anything.
-    # A backup (.<file>.<run id>.prev) whose file is missing is put back. Every other temporary file
-    # (.<file>.<run id>.tmp) and backup older than this run is deleted. What it does is written to errors.log.
+    # A backup (.<file>.<run id>.prev) whose file is missing is put back. When the history is still missing after
+    # that, a temporary history (.outbound-baseline-history.json.<run id>.tmp) that reads as a whole history is made
+    # the history: an older version deleted the history before it renamed the new one in. A backup listed in .keep
+    # is left in place: a failed run could not put it back, and it is the only copy of that file's previous content.
+    # Every other temporary file and backup older than this run is deleted. What it does is written to errors.log.
+    $historyLeaf = "outbound-baseline-history.json"
+    $keepPath = Join-Path $OutputPath ".keep"
+    $keepNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+    if ([System.IO.File]::Exists($keepPath)) {
+        try {
+            foreach ($line in [System.IO.File]::ReadAllLines($keepPath)) {
+                if (-not [string]::IsNullOrWhiteSpace($line)) { $null = $keepNames.Add($line.Trim()) }
+            }
+        }
+        catch {
+            Write-M365MonitorError -Message "Cleanup after an interrupted run: could not read .keep, so no backup was removed this time." -ErrorRecord $_ -OutputPath $OutputPath
+            return [pscustomobject]@{ Restored = @(); Removed = @() }
+        }
+    }
+
     $pattern = '^\.(?<leaf>.+)\.(?<run>[^.]+)\.(?<kind>tmp|prev)$'
     $leftovers = [System.Collections.Generic.List[object]]::new()
     foreach ($file in @(Get-ChildItem -LiteralPath $OutputPath -File -Force -ErrorAction Stop)) {
@@ -367,23 +552,42 @@ function Repair-M365OutputFolder {
         $leftovers.Add([pscustomobject]@{ File = $file; Leaf = $leaf; Kind = $kind; CreatedUtc = $createdUtc })
     }
 
-    # Newest backup first, so when two interrupted runs left one for the same missing file, the later one wins.
     $restored = [System.Collections.Generic.List[string]]::new()
     $kept = [System.Collections.Generic.List[string]]::new()
-    foreach ($backup in @($leftovers | Where-Object { $_.Kind -eq "prev" } | Sort-Object CreatedUtc -Descending)) {
-        $destination = Join-Path $OutputPath $backup.Leaf
-        if ([System.IO.File]::Exists($destination) -or [System.IO.Directory]::Exists($destination)) {
-            continue
-        }
+    $restore = {
+        param($Leftover, $Destination)
         try {
-            [System.IO.File]::Move($backup.File.FullName, $destination, $false)
-            $restored.Add($backup.File.Name)
-            Write-M365MonitorError -Message "Cleanup after an interrupted run: put back $($backup.Leaf) from $($backup.File.Name), because $($backup.Leaf) was missing." -OutputPath $OutputPath
+            [System.IO.File]::Move($Leftover.File.FullName, $Destination, $false)
+            $restored.Add($Leftover.File.Name)
+            Write-M365MonitorError -Message "Cleanup after an interrupted run: put back $($Leftover.Leaf) from $($Leftover.File.Name), because $($Leftover.Leaf) was missing." -OutputPath $OutputPath
         }
         catch {
-            $kept.Add($backup.File.Name)
-            Write-M365MonitorError -Message "Cleanup after an interrupted run: could not put back $($backup.Leaf) from $($backup.File.Name), so the backup was left in place." -ErrorRecord $_ -OutputPath $OutputPath
+            $kept.Add($Leftover.File.Name)
+            Write-M365MonitorError -Message "Cleanup after an interrupted run: could not put back $($Leftover.Leaf) from $($Leftover.File.Name), so it was left in place." -ErrorRecord $_ -OutputPath $OutputPath
         }
+    }
+
+    # Newest backup first, so when two interrupted runs left one for the same missing file, the later one wins.
+    foreach ($backup in @($leftovers | Where-Object { $_.Kind -eq "prev" } | Sort-Object CreatedUtc -Descending)) {
+        $destination = Join-Path $OutputPath $backup.Leaf
+        if (-not ([System.IO.File]::Exists($destination) -or [System.IO.Directory]::Exists($destination))) {
+            & $restore $backup $destination
+        }
+    }
+
+    # The history is the one output a run cannot write again from Microsoft 365, so a whole copy of it is not thrown away.
+    $historyPath = Join-Path $OutputPath $historyLeaf
+    foreach ($temporary in @($leftovers | Where-Object { $_.Kind -eq "tmp" -and $_.Leaf -eq $historyLeaf } | Sort-Object CreatedUtc -Descending)) {
+        if ([System.IO.File]::Exists($historyPath) -or [System.IO.Directory]::Exists($historyPath)) {
+            break
+        }
+        try {
+            $null = Read-M365HistoryFile -Path $temporary.File.FullName
+        }
+        catch {
+            continue
+        }
+        & $restore $temporary $historyPath
     }
 
     $removed = [System.Collections.Generic.List[string]]::new()
@@ -391,6 +595,10 @@ function Repair-M365OutputFolder {
     foreach ($leftover in $leftovers) {
         $name = $leftover.File.Name
         if ($restored.Contains($name) -or $kept.Contains($name)) {
+            continue
+        }
+        if ($keepNames.Contains($name)) {
+            Write-M365MonitorError -Message "Cleanup after an interrupted run: kept $name because .keep lists it. It holds the previous content of $($leftover.Leaf), which a failed run could not put back. Delete it and its line in .keep once that is dealt with." -OutputPath $OutputPath
             continue
         }
         if (Remove-M365File -Path $leftover.File.FullName) {
@@ -401,6 +609,11 @@ function Repair-M365OutputFolder {
         }
     }
 
+    # .keep is only needed while a file it lists is still there.
+    if ($keepNames.Count -gt 0 -and @($keepNames | Where-Object { [System.IO.File]::Exists((Join-Path $OutputPath $_)) }).Count -eq 0) {
+        $null = Remove-M365File -Path $keepPath
+    }
+
     if ($removed.Count -gt 0) {
         Write-M365MonitorError -Message "Cleanup after an interrupted run: removed $($removed.Count) leftover file(s): $($removed -join ', ')." -OutputPath $OutputPath
     }
@@ -409,6 +622,92 @@ function Repair-M365OutputFolder {
     }
 
     return [pscustomobject]@{ Restored = @($restored); Removed = @($removed) }
+}
+
+function Initialize-M365ScanLockType {
+    # The lock object is written in C# because its Ctrl+C handler runs on a thread that has no PowerShell runspace,
+    # where a script block cannot run.
+    if ("M365ForwardingMonitor.ScanLock" -as [type]) {
+        return
+    }
+
+    Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace M365ForwardingMonitor
+{
+    public sealed class ScanLock
+    {
+        private readonly object gate = new object();
+        private readonly ManualResetEventSlim releasedSignal = new ManualResetEventSlim(false);
+        private readonly FileStream stream;
+        private ConsoleCancelEventHandler handler;
+        private bool released;
+
+        public ScanLock(FileStream stream, string lockPath, string lockText)
+        {
+            this.stream = stream;
+            LockPath = lockPath;
+            LockText = lockText;
+            handler = OnCancelKeyPress;
+            try { Console.CancelKeyPress += handler; } catch (Exception) { handler = null; }
+        }
+
+        public string LockPath { get; private set; }
+        public string LockText { get; private set; }
+        public bool Released { get { lock (gate) { return released; } } }
+
+        private void OnCancelKeyPress(object sender, ConsoleCancelEventArgs e)
+        {
+            HandleCancel(e.Cancel, e.SpecialKey == ConsoleSpecialKey.ControlBreak, TimeSpan.FromSeconds(30));
+        }
+
+        // PowerShell cancels the end of the process on Ctrl+C and stops the script instead, and the script's finally
+        // blocks put files back and then release the lock. That gets the time it needs before this releases the lock
+        // itself. When the process is about to end (Ctrl+Break, or no host kept it alive), the lock is released now.
+        public void HandleCancel(bool processContinues, bool isBreak, TimeSpan grace)
+        {
+            if (!processContinues || isBreak)
+            {
+                Release();
+                return;
+            }
+            Task.Run(() => { if (!releasedSignal.Wait(grace)) { Release(); } });
+        }
+
+        // Closes the lock and deletes it while it still holds what this scan wrote. Returns false when it could not.
+        public bool Release()
+        {
+            lock (gate)
+            {
+                if (released) { return true; }
+                released = true;
+                if (handler != null) { try { Console.CancelKeyPress -= handler; } catch (Exception) { } }
+                try { stream.Dispose(); } catch (Exception) { }
+                bool removed = true;
+                try
+                {
+                    string current;
+                    using (var reader = new FileStream(LockPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+                    using (var text = new StreamReader(reader))
+                    {
+                        current = text.ReadToEnd();
+                    }
+                    if (current == LockText) { File.Delete(LockPath); }
+                }
+                catch (FileNotFoundException) { }
+                catch (DirectoryNotFoundException) { }
+                catch (Exception) { removed = false; }
+                releasedSignal.Set();
+                return removed;
+            }
+        }
+    }
+}
+'@
 }
 
 function Read-M365ScanLock {
@@ -441,18 +740,58 @@ function Read-M365ScanLock {
         }
     }
 
-    $startedUtc = $null
     $parsed = [datetimeoffset]::MinValue
+    $startedUtc = [System.IO.File]::GetLastWriteTimeUtc($Path)
     if ($text -match '(?m)^StartedAt:\s*(\S+)' -and
         [datetimeoffset]::TryParse($Matches[1], [cultureinfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$parsed)) {
         $startedUtc = $parsed.UtcDateTime
     }
-    else {
-        $startedUtc = [System.IO.File]::GetLastWriteTimeUtc($Path)
+    $processStartedUtc = $null
+    if ($text -match '(?m)^ProcessStartedAt:\s*(\S+)' -and
+        [datetimeoffset]::TryParse($Matches[1], [cultureinfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$parsed)) {
+        $processStartedUtc = $parsed.UtcDateTime
     }
     $processId = if ($text -match '(?m)^ProcessId:\s*(\d+)') { $Matches[1] } else { "unknown" }
+    $machineName = if ($text -match '(?m)^MachineName:[ \t]*(\S.*?)[ \t]*$') { $Matches[1] } else { "" }
 
-    return [pscustomobject]@{ Text = $text; StartedUtc = $startedUtc; ProcessId = $processId }
+    return [pscustomobject]@{
+        Text              = $text
+        StartedUtc        = $startedUtc
+        ProcessId         = $processId
+        ProcessStartedUtc = $processStartedUtc
+        MachineName       = $machineName
+    }
+}
+
+function Test-M365ScanLockHolder {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [int]$ProcessId,
+
+        [Parameter()]
+        [AllowNull()]
+        [Nullable[datetime]]$ProcessStartedUtc
+    )
+
+    # True while the process that wrote a lock on this computer is still running. The id alone is not enough: ids
+    # are reused, and in a container the scan is process 1 every time. So the start time in the lock must match the
+    # running process too. When the start time cannot be compared, the lock is respected.
+    $process = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+    if ($null -eq $process) {
+        return $false
+    }
+    if ($null -eq $ProcessStartedUtc) {
+        return $true
+    }
+    try {
+        $actualUtc = $process.StartTime.ToUniversalTime()
+    }
+    catch {
+        return $true
+    }
+    # PowerShell hands a [Nullable[datetime]] parameter over as a plain date, so it is cast, not read through .Value.
+    return [Math]::Abs(($actualUtc - [datetime]$ProcessStartedUtc).TotalSeconds) -lt 1
 }
 
 function Enter-M365ScanLock {
@@ -465,11 +804,28 @@ function Enter-M365ScanLock {
         [datetime]$StartedUtc
     )
 
-    # One scan per output folder. The lock file is created only when it does not exist yet, holds this scan's
-    # process id and UTC start time, and stays open until Exit-M365ScanLock. A lock that started more than six
-    # hours ago is taken to be left by a scan that was killed, and is taken over with a warning in errors.log.
+    # One scan per output folder. The lock file is created only when it does not exist yet. It holds this scan's
+    # process id, the time that process started, the computer name and the UTC start time of the scan, and it stays
+    # open until Exit-M365ScanLock.
+    #
+    # When a lock is already there:
+    #   - written on this computer by a process that is no longer running: taken over at once. A scan killed with
+    #     SIGKILL or SIGTERM never reaches its finally block, so this is what clears the lock it leaves.
+    #   - written on this computer by a process that is still running: respected, however old it is.
+    #   - written on another computer: respected for six hours from its start, then taken over.
+    # Each takeover is written to errors.log.
+    Initialize-M365ScanLockType
     $lockPath = Join-Path $OutputPath ".scan.lock"
     $staleAfter = [timespan]::FromHours(6)
+    $machineName = [System.Environment]::MachineName
+    $processStarted = "unknown"
+    try {
+        $processStarted = (Get-Process -Id $PID).StartTime.ToUniversalTime().ToString("o", [cultureinfo]::InvariantCulture)
+    }
+    catch {
+        Write-Verbose "The start time of this process could not be read, so the lock does not record it."
+    }
+
     $createError = $null
     for ($attempt = 1; $attempt -le 3; $attempt++) {
         $stream = $null
@@ -481,18 +837,18 @@ function Enter-M365ScanLock {
         }
 
         if ($null -ne $stream) {
-            $text = "ProcessId: $PID`nStartedAt: $($StartedUtc.ToString('o', [cultureinfo]::InvariantCulture))`n"
+            $text = "ProcessId: $PID`nProcessStartedAt: $processStarted`nMachineName: $machineName`nStartedAt: $($StartedUtc.ToString('o', [cultureinfo]::InvariantCulture))`n"
             try {
                 $bytes = [System.Text.Encoding]::UTF8.GetBytes($text)
                 $stream.Write($bytes, 0, $bytes.Length)
-                $stream.Flush()
+                $stream.Flush($true)
             }
             catch {
                 $stream.Dispose()
                 $null = Remove-M365File -Path $lockPath
                 throw "Could not write the scan lock $lockPath. $($_.Exception.GetBaseException().Message)"
             }
-            return [pscustomobject]@{ Path = $lockPath; Stream = $stream; Text = $text }
+            return [M365ForwardingMonitor.ScanLock]::new($stream, $lockPath, $text)
         }
 
         $holder = Read-M365ScanLock -Path $lockPath
@@ -502,8 +858,22 @@ function Enter-M365ScanLock {
         }
 
         $startedText = $holder.StartedUtc.ToString("yyyy-MM-ddTHH:mm:ssZ", [cultureinfo]::InvariantCulture)
-        if (([datetime]::UtcNow - $holder.StartedUtc) -lt $staleAfter) {
+        $holderName = if ($holder.MachineName) { $holder.MachineName } else { "an unknown computer" }
+        $sameMachine = -not [string]::IsNullOrWhiteSpace($holder.MachineName) -and [string]::Equals($holder.MachineName, $machineName, [System.StringComparison]::OrdinalIgnoreCase)
+        if ($sameMachine -and $holder.ProcessId -match '^\d+$') {
+            if (Test-M365ScanLockHolder -ProcessId ([int]$holder.ProcessId) -ProcessStartedUtc $holder.ProcessStartedUtc) {
+                if (([datetime]::UtcNow - $holder.StartedUtc) -ge $staleAfter) {
+                    Write-M365MonitorError -Message "A scan in $OutputPath that started $startedText (process $($holder.ProcessId) on this computer) is still running after more than six hours, so this scan did not start." -OutputPath $OutputPath
+                }
+                throw "Another scan is running in $OutputPath (started $startedText). It is process $($holder.ProcessId) on this computer."
+            }
+            $reason = "process $($holder.ProcessId) on this computer is no longer running"
+        }
+        elseif (([datetime]::UtcNow - $holder.StartedUtc) -lt $staleAfter) {
             throw "Another scan is running in $OutputPath (started $startedText). If no scan is running, delete $lockPath and run the scan again."
+        }
+        else {
+            $reason = "it started more than six hours ago on another computer, so it is taken to have stopped without removing its lock"
         }
 
         # Read it again just before removing it, so a lock another scan took over a moment ago is left alone.
@@ -516,9 +886,9 @@ function Enter-M365ScanLock {
         }
         catch {
             # On Windows a lock that a live scan still holds open cannot be deleted.
-            throw "Another scan is running in $OutputPath (started $startedText). Its lock is more than six hours old but is still held open."
+            throw "Another scan is running in $OutputPath (started $startedText). Its lock is still held open."
         }
-        Write-M365MonitorError -Message "Took over the scan lock in $OutputPath from a scan that started $startedText (process $($holder.ProcessId)), more than six hours ago. That scan is taken to have stopped without removing its lock." -OutputPath $OutputPath
+        Write-M365MonitorError -Message "Took over the scan lock in $OutputPath from a scan that started $startedText (process $($holder.ProcessId) on $holderName): $reason." -OutputPath $OutputPath
     }
 
     $reason = if ($createError) { $createError.Exception.GetBaseException().Message } else { "Another scan kept taking it." }
@@ -534,23 +904,104 @@ function Exit-M365ScanLock {
     )
 
     # Closes and deletes this scan's lock. It is deleted only while it still holds what this scan wrote, so a lock
-    # another scan took over is left alone.
+    # another scan took over is left alone. The lock also releases itself on Ctrl+C (see Initialize-M365ScanLockType).
+    # SIGTERM and SIGKILL cannot be caught by the script; the next scan sees that the process that wrote the lock is
+    # gone and takes it over at once.
     if ($null -eq $Lock) {
         return
     }
 
-    $Lock.Stream.Dispose()
-    $current = Read-M365ScanLock -Path $Lock.Path
-    if ($null -ne $current -and $current.Text -eq $Lock.Text -and -not (Remove-M365File -Path $Lock.Path)) {
-        Write-Warning "Could not remove the scan lock $($Lock.Path). Delete it before the next scan, or that scan waits until the lock is six hours old."
+    if (-not $Lock.Release()) {
+        Write-Warning "Could not remove the scan lock $($Lock.LockPath). The next scan on this computer takes it over once this process has ended."
+    }
+}
+
+function Get-M365PreviousFinding {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$OutputPath
+    )
+
+    # The rows of the forwarding-findings.json the previous run wrote, or nothing when there is none or it cannot
+    # be read. It is read before this run replaces it.
+    $path = Join-Path $OutputPath "forwarding-findings.json"
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        return
+    }
+
+    try {
+        Read-M365JsonFile -Path $path | Where-Object { $_ -is [System.Management.Automation.PSCustomObject] }
+    }
+    catch {
+        Write-M365MonitorError -Message "Could not read the previous forwarding-findings.json, so the last scan's findings could not be kept for the users whose reads failed." -ErrorRecord $_ -OutputPath $OutputPath
+    }
+}
+
+function Resolve-M365NoMailboxUser {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [System.Collections.Generic.List[string]]$FailedMailboxUsers,
+
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [System.Collections.Generic.List[string]]$NoMailboxUsers,
+
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [System.Collections.Generic.List[string]]$FailedRuleUsers,
+
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [System.Collections.Generic.List[string]]$NoRuleMailboxUsers,
+
+        [Parameter()]
+        [AllowEmptyCollection()]
+        [object[]]$PreviousFindings = @(),
+
+        [Parameter(Mandatory)]
+        [string]$OutputPath
+    )
+
+    # "No mailbox" means there is nothing to check, so it must not be what a blind read looks like. An account is
+    # moved from a collector's no-mailbox list to its failed list, in place, when:
+    #   - the other collector read that account's mailbox in this run, so the mailbox is there; or
+    #   - the previous report has forwards for that account, so it had a mailbox until now.
+    # A failed read keeps the last scan's findings and makes the run a partial scan; no mailbox does neither.
+    $comparer = [System.StringComparer]::OrdinalIgnoreCase
+    $mailboxNotRead = [System.Collections.Generic.HashSet[string]]::new([string[]]@($FailedMailboxUsers + $NoMailboxUsers), $comparer)
+    $rulesNotRead = [System.Collections.Generic.HashSet[string]]::new([string[]]@($FailedRuleUsers + $NoRuleMailboxUsers), $comparer)
+    $previousUsers = [System.Collections.Generic.HashSet[string]]::new([string[]]@($PreviousFindings | ForEach-Object { [string]$_.UserPrincipalName } | Where-Object { $_ }), $comparer)
+
+    foreach ($collector in @(
+            @{ Label = "Mailbox forwarding"; Said = "Get-Mailbox reported no mailbox"; Other = "Microsoft Graph read the inbox rules in this run"; NoMailbox = $NoMailboxUsers; Failed = $FailedMailboxUsers; OtherNotRead = $rulesNotRead }
+            @{ Label = "Inbox rules"; Said = "Microsoft Graph reported no mailbox"; Other = "Get-Mailbox read the mailbox in this run"; NoMailbox = $NoRuleMailboxUsers; Failed = $FailedRuleUsers; OtherNotRead = $mailboxNotRead })) {
+        foreach ($upn in @($collector.NoMailbox)) {
+            $why = $null
+            if (-not $collector.OtherNotRead.Contains($upn)) {
+                $why = $collector.Other
+            }
+            elseif ($previousUsers.Contains($upn)) {
+                $why = "the last report has forwards for this account"
+            }
+            if ($null -eq $why) {
+                continue
+            }
+            $null = $collector.NoMailbox.Remove($upn)
+            $collector.Failed.Add($upn)
+            Write-M365MonitorError -Message "$($collector.Label) for ${upn}: $($collector.Said), but $why, so this is counted as a failed read." -OutputPath $OutputPath
+        }
     }
 }
 
 function Get-M365CarriedFinding {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)]
-        [string]$OutputPath,
+        [Parameter()]
+        [AllowEmptyCollection()]
+        [object[]]$PreviousFindings = @(),
 
         [Parameter()]
         [AllowEmptyCollection()]
@@ -562,14 +1013,25 @@ function Get-M365CarriedFinding {
 
         [Parameter()]
         [AllowEmptyCollection()]
-        [string[]]$NoMailboxUsers = @()
+        [string[]]$NoMailboxUsers = @(),
+
+        [Parameter(Mandatory)]
+        [object]$Settings,
+
+        [Parameter()]
+        [AllowEmptyCollection()]
+        [object[]]$ApprovedExceptions = @()
     )
 
-    # Returns the rows of the previous forwarding-findings.json for users whose reads failed in this run, so a known
-    # forward does not drop off the report because of one bad read. A failed mailbox read keeps the user's mailbox
-    # forwarding rows and a failed inbox rule read keeps the user's inbox rule rows; what this run did read replaces
-    # the rest. Each kept row is marked NotRechecked and keeps the DetectedAt of the scan that found it.
-    # An account listed under UsersWithoutMailbox has nothing to forward, so its rows are not kept.
+    # Returns the rows of the previous report for users whose reads failed in this run, so a known forward does not
+    # drop off the report because of one bad read. A failed mailbox read keeps the user's mailbox forwarding rows and
+    # a failed inbox rule read keeps the user's inbox rule rows; what this run did read replaces the rest. Each kept
+    # row is marked NotRechecked and keeps the DetectedAt of the scan that found it. An account listed under
+    # UsersWithoutMailbox has nothing to forward, so its rows are not kept.
+    #
+    # The forward itself was not read again, but the rules it is judged by are this run's: IsExternal,
+    # IsPersonalDomain, ApprovedException and RiskLevel are worked out again from ForwardTarget with the current
+    # settings and exceptions, so an expired exception or a changed domain list counts at once.
     $comparer = [System.StringComparer]::OrdinalIgnoreCase
     $mailboxFailed = [System.Collections.Generic.HashSet[string]]::new([string[]]@($MailboxFailedUsers), $comparer)
     $ruleFailed = [System.Collections.Generic.HashSet[string]]::new([string[]]@($RuleFailedUsers), $comparer)
@@ -578,20 +1040,7 @@ function Get-M365CarriedFinding {
         return
     }
 
-    $path = Join-Path $OutputPath "forwarding-findings.json"
-    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
-        return
-    }
-
-    try {
-        $previous = @(Read-M365JsonFile -Path $path)
-    }
-    catch {
-        Write-M365MonitorError -Message "Could not read the previous forwarding-findings.json, so the last scan's findings could not be kept for the users whose reads failed." -ErrorRecord $_ -OutputPath $OutputPath
-        return
-    }
-
-    foreach ($row in $previous) {
+    foreach ($row in @($PreviousFindings)) {
         if ($row -isnot [System.Management.Automation.PSCustomObject]) {
             continue
         }
@@ -601,7 +1050,8 @@ function Get-M365CarriedFinding {
         }
         # Plain assignments: an if expression would send the set down the pipeline and hand back its items.
         $failedUsers = $ruleFailed
-        if ([string]$row.ForwardingType -eq "MailboxForwarding") {
+        $isMailboxRow = [string]$row.ForwardingType -eq "MailboxForwarding"
+        if ($isMailboxRow) {
             $failedUsers = $mailboxFailed
         }
         if (-not $failedUsers.Contains($upn)) {
@@ -612,6 +1062,21 @@ function Get-M365CarriedFinding {
         if ($row.DetectedAt -is [datetime]) {
             $row.DetectedAt = $row.DetectedAt.ToString("o", [cultureinfo]::InvariantCulture)
         }
+
+        $target = [string]$row.ForwardTarget
+        $domain = Get-M365TargetDomain -Target $target
+        $isExternal = -not (Test-M365InternalDomain -Domain $domain -InternalDomains $Settings.InternalDomains)
+        $isPersonal = Test-M365PersonalDomain -Domain $domain -PersonalDomains $Settings.PersonalDomains
+        $approved = Test-M365ApprovedException -UserPrincipalName $upn -Target $target -ApprovedExceptions $ApprovedExceptions
+        $enabled = $true
+        if (-not $isMailboxRow -and $row.PSObject.Properties.Name -contains "RuleEnabled" -and $null -ne $row.RuleEnabled) {
+            $enabled = [bool]$row.RuleEnabled
+        }
+        Add-M365Property -InputObject $row -Name "TargetDomain" -Value $domain
+        Add-M365Property -InputObject $row -Name "IsExternal" -Value ([bool]$isExternal)
+        Add-M365Property -InputObject $row -Name "IsPersonalDomain" -Value ([bool]$isPersonal)
+        Add-M365Property -InputObject $row -Name "ApprovedException" -Value ([bool]$approved)
+        Add-M365Property -InputObject $row -Name "RiskLevel" -Value (Get-M365ForwardingRiskLevel -RuleEnabled $enabled -IsExternal $isExternal -IsPersonalDomain $isPersonal -ApprovedException $approved)
         Add-M365Property -InputObject $row -Name "NotRechecked" -Value $true
         $row
     }
@@ -633,8 +1098,9 @@ function Update-M365OutboundBaseline {
 
     # Returns Records, the history records to write, and HistoryUnreadable. The caller stages Records with the other
     # output files unless HistoryUnreadable is set: a history file that is there but cannot be read or parsed (locked,
-    # cut short, empty) is left exactly as it is, because writing this run's records over it would replace weeks of
-    # baseline with one day. The baselines in that run start from no history.
+    # cut short, empty, a record without an ISO 8601 DetectedAt) is left exactly as it is, because writing this run's
+    # records over it would replace weeks of baseline with one day. The baselines in that run start from no history,
+    # and the caller reports the run as degraded.
     # Metadata-only baseline: stores sender, counts, domains, and timestamps only.
     # It does not store email subjects, bodies, previews, attachments, or message content.
     $historyPath = Join-Path $OutputPath "outbound-baseline-history.json"
@@ -642,15 +1108,7 @@ function Update-M365OutboundBaseline {
     $historyUnreadable = $false
     if (Test-Path -LiteralPath $historyPath) {
         try {
-            $history = @(Read-M365JsonFile -Path $historyPath)
-            foreach ($record in $history) {
-                if ($record -isnot [System.Management.Automation.PSCustomObject]) {
-                    throw "It holds a value that is not a history record."
-                }
-                # Every record the tool writes has a DetectedAt. One that is missing or is not a date means the
-                # file is not what this tool wrote.
-                $null = [datetime]$record.DetectedAt
-            }
+            $history = @(Read-M365HistoryFile -Path $historyPath)
         }
         catch {
             Write-M365MonitorError -Message "Could not read outbound baseline history $historyPath, so it was left as it is and this run did not add to it. Baselines in this run start from no history. Repair or move the file so the next run can write it." -ErrorRecord $_ -OutputPath $OutputPath
@@ -661,7 +1119,18 @@ function Update-M365OutboundBaseline {
 
     $multiplier = if ($Settings.PSObject.Properties.Name -contains "BaselineMultiplier") { [double]$Settings.BaselineMultiplier } else { 2.5 }
     $minimumSamples = if ($Settings.PSObject.Properties.Name -contains "BaselineMinimumSamples") { [int]$Settings.BaselineMinimumSamples } else { 3 }
-    $retentionDays = if ($Settings.PSObject.Properties.Name -contains "BaselineRetentionDays") { [int]$Settings.BaselineRetentionDays } else { 90 }
+    # A retention of zero days or less would drop the whole history on the next write, so it falls back to 90.
+    $retentionDays = 90
+    if ($Settings.PSObject.Properties.Name -contains "BaselineRetentionDays") {
+        $configuredDays = [int]$Settings.BaselineRetentionDays
+        if ($configuredDays -gt 0) {
+            $retentionDays = $configuredDays
+        }
+        else {
+            Write-M365MonitorError -Message "BaselineRetentionDays is $configuredDays, which would drop the whole baseline history. Using the default of 90 days." -OutputPath $OutputPath
+            Write-Warning "BaselineRetentionDays is $configuredDays. Using the default of 90 days."
+        }
+    }
     $cutoff = (Get-Date).AddDays(-1 * $retentionDays)
 
     $currentRecords = [System.Collections.Generic.List[object]]::new()
@@ -778,12 +1247,19 @@ try {
 
     # A scan that cannot see must not report all clear. Users the collectors could not read are counted and
     # reported, and if a collector could not read any user the run stops before any output file changes.
+    # A collector that sees no mailbox for anyone is not looking at this tenant's mailboxes: the session is in another
+    # tenant, or the account cannot see the recipients. That stops the run like a collector that could read nobody.
+    $blindMessage = "The session is probably signed in to the wrong tenant, or the account lacks recipient scope for these mailboxes. No output files were changed. Check TenantId and ExchangeOrganization in settings.json and the account's roles."
+
     Write-Host "Scanning mailbox-level forwarding..."
     $failedMailboxUsers = [System.Collections.Generic.List[string]]::new()
     $noMailboxUsers = [System.Collections.Generic.List[string]]::new()
     $mailboxForwarding = @(Get-M365ForwardingInventory -Users $users -Settings $settings -ApprovedExceptions $approvedExceptions -OutputPath $outputPath -FailedUsers $failedMailboxUsers -NoMailboxUsers $noMailboxUsers)
     if ($failedMailboxUsers.Count -gt 0 -and ($failedMailboxUsers.Count + $noMailboxUsers.Count) -ge $scannableUserCount) {
         throw "Mailbox forwarding could not be read for any scanned user ($($failedMailboxUsers.Count) of $scannableUserCount failed). No output files were changed. See errors.log."
+    }
+    if ($scannableUserCount -gt 0 -and $noMailboxUsers.Count -ge $scannableUserCount) {
+        throw "Exchange Online reported no mailbox for any of the $scannableUserCount scanned users. $blindMessage"
     }
 
     Write-Host "Scanning inbox forwarding rules..."
@@ -793,14 +1269,28 @@ try {
     if ($failedRuleUsers.Count -gt 0 -and ($failedRuleUsers.Count + $noRuleMailboxUsers.Count) -ge $scannableUserCount) {
         throw "Inbox rules could not be read for any scanned user ($($failedRuleUsers.Count) of $scannableUserCount failed). No output files were changed. See errors.log."
     }
+    if ($scannableUserCount -gt 0 -and $noRuleMailboxUsers.Count -ge $scannableUserCount) {
+        throw "Microsoft Graph reported no mailbox for any of the $scannableUserCount scanned users. $blindMessage"
+    }
+
+    # An account one collector says has no mailbox is a failed read when the other collector read its mailbox, or
+    # when the last report has forwards for it. The previous report is read once, before it is replaced.
+    $previousFindings = @()
+    if (($failedMailboxUsers.Count + $noMailboxUsers.Count + $failedRuleUsers.Count + $noRuleMailboxUsers.Count) -gt 0) {
+        $previousFindings = @(Get-M365PreviousFinding -OutputPath $outputPath)
+    }
+    Resolve-M365NoMailboxUser -FailedMailboxUsers $failedMailboxUsers -NoMailboxUsers $noMailboxUsers -FailedRuleUsers $failedRuleUsers `
+        -NoRuleMailboxUsers $noRuleMailboxUsers -PreviousFindings $previousFindings -OutputPath $outputPath
 
     # Every finding read in this run was checked in this run. For a user whose reads failed, the last scan's
-    # findings are kept and marked, so a known forward does not drop off the report because of one bad read.
+    # findings are kept, scored again with this run's settings and marked, so a known forward does not drop off
+    # the report because of one bad read.
     foreach ($finding in @($mailboxForwarding + $ruleForwarding)) {
         Add-M365Property -InputObject $finding -Name "NotRechecked" -Value $false
     }
     $usersWithoutMailbox = @($noMailboxUsers + $noRuleMailboxUsers | Select-Object -Unique)
-    $carriedFindings = @(Get-M365CarriedFinding -OutputPath $outputPath -MailboxFailedUsers $failedMailboxUsers -RuleFailedUsers $failedRuleUsers -NoMailboxUsers $usersWithoutMailbox)
+    $carriedFindings = @(Get-M365CarriedFinding -PreviousFindings $previousFindings -MailboxFailedUsers $failedMailboxUsers -RuleFailedUsers $failedRuleUsers `
+            -NoMailboxUsers $usersWithoutMailbox -Settings $settings -ApprovedExceptions $approvedExceptions)
     if ($carriedFindings.Count -gt 0) {
         $mailboxForwarding = @($mailboxForwarding + @($carriedFindings | Where-Object { $_.ForwardingType -eq "MailboxForwarding" }))
         $ruleForwarding = @($ruleForwarding + @($carriedFindings | Where-Object { $_.ForwardingType -ne "MailboxForwarding" }))
@@ -828,6 +1318,7 @@ try {
         AbnormalOutboundCount             = @($outboundCounts | Where-Object { $_.RiskLevel -in @("Medium", "Critical") }).Count
         AboveBaselineOutboundCount        = @($outboundCounts | Where-Object { $_.IsAboveBaseline }).Count
         TraceTruncated                    = [bool]$traceStatus.Truncated
+        BaselineDegraded                  = [bool]$baseline.HistoryUnreadable
         UsersWithoutMailbox               = [pscustomobject]@{
             Count              = $usersWithoutMailbox.Count
             UserPrincipalNames = $usersWithoutMailbox
@@ -858,42 +1349,42 @@ try {
     }
     Add-M365StagedFile -Staged $stagedFiles -RunId $runId -Path (Join-Path $outputPath "summary.json") -Write {
         param($TempPath)
-        $summary | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $TempPath -Encoding UTF8
+        Write-M365TextFile -Path $TempPath -Text (($summary | ConvertTo-Json -Depth 5) + [Environment]::NewLine)
     }
     Add-M365StagedFile -Staged $stagedFiles -RunId $runId -Path (Join-Path $outputPath "forwarding-findings.csv") -Write {
         param($TempPath)
-        $allForwarding |
-            ForEach-Object {
-                $csvRow = $_.PSObject.Copy()
-                foreach ($property in $csvRow.PSObject.Properties) {
-                    if ($property.Value -is [string]) { $property.Value = ConvertTo-M365CsvSafeValue $property.Value }
-                }
-                $csvRow
-            } |
-            Select-Object -Property $findingColumns |
-            Export-Csv -LiteralPath $TempPath -NoTypeInformation
+        $rows = @($allForwarding |
+                ForEach-Object {
+                    $csvRow = $_.PSObject.Copy()
+                    foreach ($property in $csvRow.PSObject.Properties) {
+                        if ($property.Value -is [string]) { $property.Value = ConvertTo-M365CsvSafeValue $property.Value }
+                    }
+                    $csvRow
+                } |
+                Select-Object -Property $findingColumns)
+        Write-M365CsvFile -InputObject $rows -Path $TempPath
     }
     Add-M365StagedFile -Staged $stagedFiles -RunId $runId -Path (Join-Path $outputPath "outbound-metadata-counts.csv") -Write {
         param($TempPath)
-        $outboundCounts |
-            Select-Object Date,
-                @{ Name = "UserPrincipalName"; Expression = { ConvertTo-M365CsvSafeValue $_.UserPrincipalName } },
-                @{ Name = "SenderAddress"; Expression = { ConvertTo-M365CsvSafeValue $_.SenderAddress } },
-                ExternalSentCount, UniqueExternalRecipientCount,
-                @{ Name = "TopExternalDomains"; Expression = { ConvertTo-M365CsvSafeValue $_.TopExternalDomains } },
-                AfterHoursCount, BaselineAverage, BaselineSampleCount, BaselineMultiplier, IsAboveBaseline, CountDeltaFromBaseline, RiskLevel, DetectedAt |
-            Export-Csv -LiteralPath $TempPath -NoTypeInformation
+        $rows = @($outboundCounts |
+                Select-Object Date,
+                    @{ Name = "UserPrincipalName"; Expression = { ConvertTo-M365CsvSafeValue $_.UserPrincipalName } },
+                    @{ Name = "SenderAddress"; Expression = { ConvertTo-M365CsvSafeValue $_.SenderAddress } },
+                    ExternalSentCount, UniqueExternalRecipientCount,
+                    @{ Name = "TopExternalDomains"; Expression = { ConvertTo-M365CsvSafeValue $_.TopExternalDomains } },
+                    AfterHoursCount, BaselineAverage, BaselineSampleCount, BaselineMultiplier, IsAboveBaseline, CountDeltaFromBaseline, RiskLevel, DetectedAt)
+        Write-M365CsvFile -InputObject $rows -Path $TempPath
     }
     Add-M365StagedFile -Staged $stagedFiles -RunId $runId -Path (Join-Path $outputPath "summary.csv") -Write {
         param($TempPath)
         # One flat row: the failure lists stay in summary.json, the CSV carries their counts.
-        $summary |
-            Select-Object -Property * -ExcludeProperty CollectionFailures, UsersWithoutMailbox |
-            Select-Object -Property *,
-                @{ Name = "UsersWithoutMailbox"; Expression = { $summary.UsersWithoutMailbox.Count } },
-                @{ Name = "MailboxForwardingFailures"; Expression = { $summary.CollectionFailures.MailboxForwarding.Count } },
-                @{ Name = "InboxRuleFailures"; Expression = { $summary.CollectionFailures.InboxRules.Count } } |
-            Export-Csv -LiteralPath $TempPath -NoTypeInformation
+        $rows = @($summary |
+                Select-Object -Property * -ExcludeProperty CollectionFailures, UsersWithoutMailbox |
+                Select-Object -Property *,
+                    @{ Name = "UsersWithoutMailbox"; Expression = { $summary.UsersWithoutMailbox.Count } },
+                    @{ Name = "MailboxForwardingFailures"; Expression = { $summary.CollectionFailures.MailboxForwarding.Count } },
+                    @{ Name = "InboxRuleFailures"; Expression = { $summary.CollectionFailures.InboxRules.Count } })
+        Write-M365CsvFile -InputObject $rows -Path $TempPath
     }
     if ($baseline.HistoryUnreadable) {
         Write-Host "The outbound baseline history could not be read, so this run left it as it is. See errors.log."
@@ -920,11 +1411,11 @@ try {
     Write-Host "External forwarding findings: $($summary.ExternalForwardingCount)"
     Write-Host "High/Critical forwarding risks: $($summary.HighCriticalRiskCount)"
     Write-Host "Abnormal outbound metadata rows: $($summary.AbnormalOutboundCount)"
-    if ($failedMailboxUsers.Count -gt 0 -or $failedRuleUsers.Count -gt 0 -or $traceStatus.Truncated) {
-        Write-Host "INCOMPLETE SCAN: mailbox read failures $($failedMailboxUsers.Count), inbox rule read failures $($failedRuleUsers.Count), message trace truncated $($traceStatus.Truncated). See the dashboard and errors.log."
+    if ($failedMailboxUsers.Count -gt 0 -or $failedRuleUsers.Count -gt 0 -or $traceStatus.Truncated -or $baseline.HistoryUnreadable) {
+        Write-Host "INCOMPLETE SCAN: mailbox read failures $($failedMailboxUsers.Count), inbox rule read failures $($failedRuleUsers.Count), message trace truncated $($traceStatus.Truncated), baseline history unreadable $([bool]$baseline.HistoryUnreadable). See the dashboard and errors.log."
     }
     Write-Host "Dashboard: $dashboard"
-    $isPartialScan = $failedMailboxUsers.Count -gt 0 -or $failedRuleUsers.Count -gt 0
+    $isPartialScan = $failedMailboxUsers.Count -gt 0 -or $failedRuleUsers.Count -gt 0 -or $baseline.HistoryUnreadable
 }
 catch {
     Write-M365MonitorError -Message "Invoke-ForwardingMonitor failed." -ErrorRecord $_ -OutputPath $outputPath
